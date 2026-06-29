@@ -38,6 +38,11 @@ fn cases() -> Vec<Case> {
             opts: orig,
         },
         Case {
+            name: "realtest1",
+            input_file: "realtest1.rs",
+            opts: orig,
+        },
+        Case {
             name: "whole_alphabetical",
             input_file: "whole_basic.rs",
             opts: alpha,
@@ -158,7 +163,9 @@ fn check_fails_on_later_non_mutual_dependency() {
     let report = check(bad).unwrap();
     assert_eq!(report.violations.len(), 1);
     assert_eq!(report.violations[0].user, "user");
+    assert_eq!(report.violations[0].user_line, 1);
     assert_eq!(report.violations[0].dependency, "dep");
+    assert_eq!(report.violations[0].dependency_line, 2);
 
     let mutual = "fn a(){b();}\nfn b(){a();}";
     assert!(check(mutual).unwrap().is_ok());
@@ -180,6 +187,24 @@ fn outside_topological_emits_dependency_chain_before_unrelated_items() {
     let user = out.find("fn user").unwrap();
     let unrelated = out.find("fn unrelated").unwrap();
     assert!(dep < user && user < unrelated, "{out}");
+}
+
+#[test]
+fn preserves_adjacent_declaration_spacing() {
+    let src = "type A = u8;\ntype B = A;\nconst C: u8 = 1;\nconst D: u8 = C;\n";
+    let out = reorder(
+        src,
+        OrderOpts {
+            inside: Tie::Original,
+            outside: Tie::Original,
+        },
+    )
+    .unwrap()
+    .new_src;
+    assert!(out.contains("type A = u8;\ntype B = A;"), "{out}");
+    assert!(out.contains("const C: u8 = 1;\nconst D: u8 = C;"), "{out}");
+    assert!(!out.contains("type A = u8;\n\ntype B = A;"), "{out}");
+    assert!(!out.contains("const C: u8 = 1;\n\nconst D: u8 = C;"), "{out}");
 }
 
 #[test]
@@ -205,7 +230,7 @@ fn cli_requires_command_and_check_reports_violations() {
 
     assert!(!check.status.success());
     let stdout = String::from_utf8_lossy(&check.stdout);
-    assert!(stdout.contains("user uses later dep"), "{stdout}");
+    assert!(stdout.contains("user uses later dep (line 1 before line 2"), "{stdout}");
     assert!(!stdout.contains("items moved"), "{stdout}");
     assert!(!stdout.contains("dry run"), "{stdout}");
 }

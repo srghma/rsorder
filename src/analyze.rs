@@ -72,10 +72,16 @@ pub fn parse(src: &str) -> syn::Result<FileModel> {
 
     let mut leads = vec![String::new(); raws.len()];
     let mut floats = vec![String::new(); raws.len()];
+    let mut blank_before = vec![false; raws.len()];
+    if let Some(first) = raws.first() {
+        blank_before[0] = ends_with_blank_line(&src[..first.1]);
+    }
     for i in 1..raws.len() {
-        let (attached, floating) = split_gap(&src[raws[i - 1].2..raws[i].1]);
+        let gap = &src[raws[i - 1].2..raws[i].1];
+        let (attached, floating) = split_gap(gap);
         leads[i] = strip_markers(&attached);
         floats[i] = strip_markers(&floating);
+        blank_before[i] = has_blank_line(gap);
     }
 
     // --- name map for dependency edges (named, non-pinned items) ---
@@ -113,6 +119,7 @@ pub fn parse(src: &str) -> syn::Result<FileModel> {
                 pre_floating: floats[i].clone(),
                 body: src[*start..*end].trim_end().to_string(),
                 byte_start: *start,
+                blank_before: blank_before[i],
                 deps,
                 pinned,
             }
@@ -245,6 +252,22 @@ fn split_gap(gap: &str) -> (String, String) {
         .collect::<Vec<_>>()
         .join("\n");
     (attached, floating)
+}
+
+fn has_blank_line(gap: &str) -> bool {
+    gap.lines().any(|line| line.trim().is_empty()) && gap.matches('\n').count() > 1
+}
+
+fn ends_with_blank_line(s: &str) -> bool {
+    let mut newlines = 0;
+    for ch in s.chars().rev() {
+        match ch {
+            '\n' => newlines += 1,
+            '\r' | ' ' | '\t' => {}
+            _ => break,
+        }
+    }
+    newlines > 1
 }
 
 fn collect_refs(item: &syn::Item, defined: &HashSet<String>) -> HashSet<String> {

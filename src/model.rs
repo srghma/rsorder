@@ -60,6 +60,8 @@ pub struct Item {
     pub body: String,
     /// Byte offset of the item's start in the original source.
     pub byte_start: usize,
+    /// Whether the original gap before this item contained a blank line.
+    pub blank_before: bool,
     /// Global indices (into `FileModel::items`) this item depends on.
     pub deps: Vec<usize>,
     /// `use` / `extern crate` / opaque blocks are pinned (never hoisted).

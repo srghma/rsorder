@@ -25,7 +25,6 @@ pub struct Config {
 fn ping(n: u32) -> u32 {
     if n == 0 { 0 } else { pong(n - 1) }
 }
-
 fn pong(n: u32) -> u32 {
     if n == 0 { 1 } else { ping(n - 1) }
 }

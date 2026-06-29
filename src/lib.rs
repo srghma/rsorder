@@ -11,6 +11,12 @@ use std::collections::HashMap;
 
 use order::{OrderOpts, order_scope};
 
+#[derive(Debug, Clone)]
+struct Segment {
+    text: String,
+    blank_before: bool,
+}
+
 /// A reorderable node, as seen by the renderers (compact index space).
 #[derive(Debug, Clone)]
 pub struct Node {
@@ -49,8 +55,10 @@ pub struct Outcome {
 pub struct CheckViolation {
     pub user: String,
     pub user_index: usize,
+    pub user_line: usize,
     pub dependency: String,
     pub dependency_index: usize,
+    pub dependency_line: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -74,6 +82,7 @@ pub fn check(src: &str) -> syn::Result<CheckReport> {
         .map(|i| i.name.clone().unwrap_or_else(|| i.display.clone()))
         .collect();
     let deps_g: Vec<Vec<usize>> = items.iter().map(|i| i.deps.clone()).collect();
+    let line_starts = line_starts(src);
     let reorderable: Vec<usize> = items
         .iter()
         .enumerate()
@@ -107,12 +116,31 @@ pub fn check(src: &str) -> syn::Result<CheckReport> {
             violations.push(CheckViolation {
                 user: names[user].clone(),
                 user_index: user,
+                user_line: line_of_byte(&line_starts, items[user].byte_start),
                 dependency: names[dep].clone(),
                 dependency_index: dep,
+                dependency_line: line_of_byte(&line_starts, items[dep].byte_start),
             });
         }
     }
     Ok(CheckReport { violations })
+}
+
+fn line_starts(src: &str) -> Vec<usize> {
+    let mut starts = vec![0];
+    for (idx, b) in src.bytes().enumerate() {
+        if b == b'\n' {
+            starts.push(idx + 1);
+        }
+    }
+    starts
+}
+
+fn line_of_byte(line_starts: &[usize], byte: usize) -> usize {
+    match line_starts.binary_search(&byte) {
+        Ok(idx) => idx + 1,
+        Err(idx) => idx,
+    }
 }
 
 /// Reorder a single source string. `global` is the CLI-level ordering policy;
@@ -161,11 +189,11 @@ pub fn reorder(src: &str, global: OrderOpts) -> syn::Result<Outcome> {
         let (order, groups) = order_scope(&reorderable, &deps_g, &names, global);
         register_groups(groups);
 
-        let mut segs: Vec<String> = Vec::new();
-        push_nonempty(&mut segs, model.preamble.trim_end());
+        let mut segs: Vec<Segment> = Vec::new();
+        push_nonempty(&mut segs, model.preamble.trim_end(), false);
         for (i, it) in items.iter().enumerate() {
             if it.pinned {
-                segs.push(block(items, i, true));
+                segs.push(item_segment(items, i, true));
             }
         }
         let floating: String = reorderable
@@ -174,7 +202,7 @@ pub fn reorder(src: &str, global: OrderOpts) -> syn::Result<Outcome> {
             .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
             .join("\n\n");
-        push_nonempty(&mut segs, &floating);
+        push_nonempty(&mut segs, &floating, true);
         segs.extend(emit_ordered(
             &order,
             &group_of_g,
@@ -183,7 +211,7 @@ pub fn reorder(src: &str, global: OrderOpts) -> syn::Result<Outcome> {
             &g2c,
             &mut after_g,
         ));
-        push_nonempty(&mut segs, model.postamble.trim());
+        push_nonempty(&mut segs, model.postamble.trim(), true);
         new_src = join(segs);
     } else {
         // ---- scoped mode: reorder only inside regions, everything else fixed ----
@@ -209,27 +237,37 @@ pub fn reorder(src: &str, global: OrderOpts) -> syn::Result<Outcome> {
             register_groups(groups.clone());
         }
 
-        let mut segs: Vec<String> = Vec::new();
-        push_nonempty(&mut segs, model.preamble.trim_end());
+        let mut segs: Vec<Segment> = Vec::new();
+        push_nonempty(&mut segs, model.preamble.trim_end(), false);
         let mut i = 0;
         while i < items.len() {
             if let Some(&ri) = region_at.get(&i) {
                 let r = &model.regions[ri];
-                segs.push(r.start_line.clone());
+                segs.push(Segment {
+                    text: r.start_line.clone(),
+                    blank_before: items[r.first].blank_before,
+                });
                 let (order, _) = &region_orders[ri];
-                segs.extend(emit_ordered(
+                let mut emitted = emit_ordered(
                     order,
                     &group_of_g,
                     items,
                     true,
                     &g2c,
                     &mut after_g,
-                ));
-                segs.push(r.end_line.clone());
+                );
+                if let Some(first) = emitted.first_mut() {
+                    first.blank_before = false;
+                }
+                segs.extend(emitted);
+                segs.push(Segment {
+                    text: r.end_line.clone(),
+                    blank_before: false,
+                });
                 i = r.last_excl;
             } else {
                 let it = &items[i];
-                segs.push(block(items, i, true));
+                segs.push(item_segment(items, i, true));
                 if let Some(&c) = g2c.get(&i) {
                     after_g.push(reorderable[c]); // record global; mapped below
                 }
@@ -237,7 +275,7 @@ pub fn reorder(src: &str, global: OrderOpts) -> syn::Result<Outcome> {
                 i += 1;
             }
         }
-        push_nonempty(&mut segs, model.postamble.trim());
+        push_nonempty(&mut segs, model.postamble.trim(), true);
         new_src = join(segs);
     }
 
@@ -302,20 +340,35 @@ fn kind_counts(items: &[model::Item]) -> Vec<(String, usize)> {
     m.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
 }
 
-fn push_nonempty(segs: &mut Vec<String>, s: &str) {
+fn push_nonempty(segs: &mut Vec<Segment>, s: &str, blank_before: bool) {
     if !s.trim().is_empty() {
-        segs.push(s.to_string());
+        segs.push(Segment {
+            text: s.to_string(),
+            blank_before,
+        });
     }
 }
 
-fn join(segs: Vec<String>) -> String {
-    let mut out = segs
-        .into_iter()
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n");
+fn join(segs: Vec<Segment>) -> String {
+    let mut out = String::new();
+    for seg in segs.into_iter().filter(|s| !s.text.is_empty()) {
+        if !out.is_empty() {
+            out.push('\n');
+            if seg.blank_before {
+                out.push('\n');
+            }
+        }
+        out.push_str(&seg.text);
+    }
     out.push('\n');
     out
+}
+
+fn item_segment(items: &[model::Item], i: usize, include_floating: bool) -> Segment {
+    Segment {
+        text: block(items, i, include_floating),
+        blank_before: items[i].blank_before,
+    }
 }
 
 fn block(items: &[model::Item], i: usize, include_floating: bool) -> String {
@@ -340,7 +393,7 @@ fn emit_ordered(
     include_floating: bool,
     _g2c: &HashMap<usize, usize>,
     after_g: &mut Vec<usize>,
-) -> Vec<String> {
+) -> Vec<Segment> {
     let mut segs = Vec::new();
     let mut i = 0;
     while i < order.len() {
@@ -349,9 +402,13 @@ fn emit_ordered(
         if gid >= 0 {
             let mut group = String::from("// mutual start\n");
             let mut first = true;
+            let blank_before = items[g].blank_before;
             while i < order.len() && group_of_g.get(&order[i]).copied().unwrap_or(-1) == gid {
                 if !first {
-                    group.push_str("\n\n");
+                    group.push('\n');
+                    if items[order[i]].blank_before {
+                        group.push('\n');
+                    }
                 }
                 first = false;
                 group.push_str(&block(items, order[i], include_floating));
@@ -359,9 +416,12 @@ fn emit_ordered(
                 i += 1;
             }
             group.push_str("\n// mutual end");
-            segs.push(group);
+            segs.push(Segment {
+                text: group,
+                blank_before,
+            });
         } else {
-            segs.push(block(items, g, include_floating));
+            segs.push(item_segment(items, g, include_floating));
             after_g.push(g);
             i += 1;
         }

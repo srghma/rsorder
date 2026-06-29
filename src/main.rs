@@ -434,9 +434,11 @@ async fn process_check(path: PathBuf, src: String, paint: Paint) -> Option<FileR
             )));
             for v in report.violations {
                 lines.push(format!(
-                    "  {} uses later {} (item #{} before #{})",
+                    "  {} uses later {} (line {} before line {}, item #{} before #{})",
                     v.user,
                     v.dependency,
+                    v.user_line,
+                    v.dependency_line,
                     v.user_index + 1,
                     v.dependency_index + 1
                 ));
