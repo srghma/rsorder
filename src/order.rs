@@ -71,7 +71,11 @@ pub fn order_scope(
         Tie::Original | Tie::Alphabetical => {
             let key = |c: usize| -> (String, usize) {
                 let min_g = comps[c].iter().map(|&l| members[l]).min().unwrap();
-                let min_name = comps[c].iter().map(|&l| names[members[l]].clone()).min().unwrap();
+                let min_name = comps[c]
+                    .iter()
+                    .map(|&l| names[members[l]].clone())
+                    .min()
+                    .unwrap();
                 (min_name, min_g)
             };
             let cmp = |a: usize, b: usize| {
@@ -87,7 +91,9 @@ pub fn order_scope(
             let mut ready: Vec<usize> = (0..ncomp).filter(|&c| indeg[c] == 0).collect();
             let mut comp_order = Vec::with_capacity(ncomp);
             while !ready.is_empty() {
-                let pick = (0..ready.len()).min_by(|&i, &j| cmp(ready[i], ready[j])).unwrap();
+                let pick = (0..ready.len())
+                    .min_by(|&i, &j| cmp(ready[i], ready[j]))
+                    .unwrap();
                 let c = ready.swap_remove(pick);
                 comp_order.push(c);
                 for &to in &succ[c] {

@@ -20,23 +20,20 @@ cargo test                 # unit + golden e2e tests
 ```
 rsorder reorder [OPTIONS] <GLOB>...
 rsorder check [OPTIONS] <GLOB>...
-rsorder [OPTIONS] <GLOB>...
 ```
 
-`reorder` is the default mode, so existing bare `rsorder ...` invocations still
-dry-run or rewrite reordered source. `check` only validates the current order
-and exits nonzero when an item uses a later non-mutual item.
+The command is required. `reorder` dry-runs or rewrites reordered source.
+`check` only validates the current order and exits nonzero when an item uses a
+later non-mutual item.
 
 ### Ordering policy
 
-Two independent tie-break controls (each defaults to **original order**):
+Two independent sorting controls (each defaults to **original**):
 
-* `--same-level-inside-of-mutual--alphabetically` — sort members *inside* a
-  mutual block alphabetically.
-* `--same-level-outside-of-mutual--alphabetically` — sort independent
-  items/components *outside* mutual blocks alphabetically.
-* `--same-level-outside-of-mutual--topological` — walk source items and emit
-  each dependency chain before unrelated items outside mutual blocks.
+* `--sorting-non-mutual=original|alphabetical|topological` — sort independent
+  items/components outside mutual blocks.
+* `--sorting-inside-mutual=original|alphabetical` — sort members inside a mutual
+  block.
 
 ### Scoped mode — `// TO REORDER` regions
 
@@ -56,7 +53,7 @@ A region header may override the global policy for that region only, using the
 same token names as the flags (without the leading `--`):
 
 ```rust
-// TO REORDER same-level-inside-of-mutual--alphabetically same-level-outside-of-mutual--original
+// TO REORDER sorting-inside-mutual=alphabetical sorting-non-mutual=original
 ... items ...
 // TO REORDER END
 ```
@@ -94,8 +91,8 @@ the paths of any files it wrote.
 ```sh
 # Dry run, alphabetical everywhere, see the result
 rsorder reorder src/lib.rs --stdout \
-  --same-level-outside-of-mutual--alphabetically \
-  --same-level-inside-of-mutual--alphabetically
+  --sorting-non-mutual=alphabetical \
+  --sorting-inside-mutual=alphabetical
 
 # Apply across a tree
 rsorder reorder 'src/**/*.rs' --write
@@ -117,8 +114,7 @@ rsorder reorder src/lib.rs --write-html-before-after-diff-table \
 * `macro_rules!` definitions are dependencies of their call sites, so a macro is
   ordered before its invocations (which Rust requires).
 * Independent items keep original relative order unless the relevant
-  `--...--alphabetically` or `--...--topological` flag (or region override) is
-  set.
+  `--sorting-non-mutual` mode or region override is set.
 
 ## Preservation guarantees
 

@@ -4,18 +4,41 @@ use quote::ToTokens;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ItemKind {
-    Fn, Struct, Enum, Union, Trait, Impl, Const, Static,
-    TypeAlias, Mod, MacroDef, MacroCall, Use, ExternCrate, Other,
+    Fn,
+    Struct,
+    Enum,
+    Union,
+    Trait,
+    Impl,
+    Const,
+    Static,
+    TypeAlias,
+    Mod,
+    MacroDef,
+    MacroCall,
+    Use,
+    ExternCrate,
+    Other,
 }
 
 impl ItemKind {
     pub fn label(self) -> &'static str {
         use ItemKind::*;
         match self {
-            Fn => "fn", Struct => "struct", Enum => "enum", Union => "union",
-            Trait => "trait", Impl => "impl", Const => "const", Static => "static",
-            TypeAlias => "type", Mod => "mod", MacroDef => "macro",
-            MacroCall => "macro-call", Use => "use", ExternCrate => "extern crate",
+            Fn => "fn",
+            Struct => "struct",
+            Enum => "enum",
+            Union => "union",
+            Trait => "trait",
+            Impl => "impl",
+            Const => "const",
+            Static => "static",
+            TypeAlias => "type",
+            Mod => "mod",
+            MacroDef => "macro",
+            MacroCall => "macro-call",
+            Use => "use",
+            ExternCrate => "extern crate",
             Other => "other",
         }
     }
@@ -44,12 +67,21 @@ pub struct Item {
 }
 
 fn clean(s: String) -> String {
-    s.replace(" :: ", "::").replace(":: ", "::").replace(" ::", "::")
-        .replace(" < ", "<").replace("< ", "<").replace(" >", ">").replace(" ,", ",")
+    s.replace(" :: ", "::")
+        .replace(":: ", "::")
+        .replace(" ::", "::")
+        .replace(" < ", "<")
+        .replace("< ", "<")
+        .replace(" >", ">")
+        .replace(" ,", ",")
 }
 
-fn path_str(p: &syn::Path) -> String { clean(p.to_token_stream().to_string()) }
-fn type_str(t: &syn::Type) -> String { clean(t.to_token_stream().to_string()) }
+fn path_str(p: &syn::Path) -> String {
+    clean(p.to_token_stream().to_string())
+}
+fn type_str(t: &syn::Type) -> String {
+    clean(t.to_token_stream().to_string())
+}
 
 /// (kind, defined-name, display-label, pinned)
 pub fn classify(item: &syn::Item) -> (ItemKind, Option<String>, String, bool) {
@@ -72,9 +104,19 @@ pub fn classify(item: &syn::Item) -> (ItemKind, Option<String>, String, bool) {
         Macro(m) => match &m.ident {
             Some(id) => {
                 let n = id.to_string();
-                (ItemKind::MacroDef, Some(n.clone()), format!("macro {n}!"), false)
+                (
+                    ItemKind::MacroDef,
+                    Some(n.clone()),
+                    format!("macro {n}!"),
+                    false,
+                )
             }
-            None => (ItemKind::MacroCall, None, format!("{}!(…)", path_str(&m.mac.path)), false),
+            None => (
+                ItemKind::MacroCall,
+                None,
+                format!("{}!(…)", path_str(&m.mac.path)),
+                false,
+            ),
         },
         Impl(i) => {
             let s = type_str(&i.self_ty);
@@ -85,7 +127,12 @@ pub fn classify(item: &syn::Item) -> (ItemKind, Option<String>, String, bool) {
             (ItemKind::Impl, None, disp, false)
         }
         Use(_) => (ItemKind::Use, None, "use …".to_string(), true),
-        ExternCrate(e) => (ItemKind::ExternCrate, None, format!("extern crate {}", e.ident), true),
+        ExternCrate(e) => (
+            ItemKind::ExternCrate,
+            None,
+            format!("extern crate {}", e.ident),
+            true,
+        ),
         ForeignMod(_) => (ItemKind::Other, None, "extern { … }".to_string(), true),
         _ => (ItemKind::Other, None, "<item>".to_string(), true),
     }

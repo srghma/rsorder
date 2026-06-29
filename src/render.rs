@@ -7,7 +7,22 @@ fn esc_label(s: &str) -> String {
     s.replace('"', "'").replace('\n', " ")
 }
 fn esc_xml(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+fn esc_json(s: &str) -> String {
+    s.chars()
+        .flat_map(|c| match c {
+            '"' => "\\\"".chars().collect::<Vec<_>>(),
+            '\\' => "\\\\".chars().collect::<Vec<_>>(),
+            '\n' => "\\n".chars().collect::<Vec<_>>(),
+            '\r' => "\\r".chars().collect::<Vec<_>>(),
+            '\t' => "\\t".chars().collect::<Vec<_>>(),
+            c => vec![c],
+        })
+        .collect()
 }
 
 /// Mermaid dependency graph with nodes declared in original source order.
@@ -17,6 +32,124 @@ pub fn mermaid_before(plan: &Plan) -> String {
         out += &format!("  N{c}[\"{}\"]\n", esc_label(&n.display));
     }
     edges(plan, &mut out);
+    out
+}
+
+/// Stable JSON dependency forest. A node is either `{ "decl": DeclId, "deps": [...] }`
+/// or `{ "mutual": [DeclId, ...], "deps": [...] }`.
+pub fn dependency_tree_json(plan: &Plan) -> String {
+    let n = plan.nodes.len();
+    let mutual_count = plan.mutual_groups.len();
+    let mut comp_of = vec![0usize; n];
+    for c in 0..n {
+        comp_of[c] = if plan.group_of[c] >= 0 {
+            plan.group_of[c] as usize
+        } else {
+            mutual_count + c
+        };
+    }
+
+    let comp_count = mutual_count + n;
+    let mut members = vec![Vec::new(); comp_count];
+    for c in 0..n {
+        members[comp_of[c]].push(c);
+    }
+
+    let mut comp_deps = vec![Vec::new(); comp_count];
+    for c in 0..n {
+        let comp = comp_of[c];
+        for &dep in &plan.deps[c] {
+            let dep_comp = comp_of[dep];
+            if dep_comp != comp && !comp_deps[comp].contains(&dep_comp) {
+                comp_deps[comp].push(dep_comp);
+            }
+        }
+    }
+
+    let mut comp_pos = vec![usize::MAX; comp_count];
+    for (pos, &c) in plan.after.iter().enumerate() {
+        comp_pos[comp_of[c]] = comp_pos[comp_of[c]].min(pos);
+    }
+    for deps in &mut comp_deps {
+        deps.sort_by_key(|&comp| comp_pos[comp]);
+    }
+
+    let mut root_comps = Vec::new();
+    for &c in &plan.after {
+        let comp = comp_of[c];
+        if !members[comp].is_empty() && !root_comps.contains(&comp) {
+            root_comps.push(comp);
+        }
+    }
+
+    let mut out = String::from("[\n");
+    for (i, comp) in root_comps.iter().enumerate() {
+        out.push_str(&component_json(*comp, &members, &comp_deps, plan, 1));
+        if i + 1 != root_comps.len() {
+            out.push(',');
+        }
+        out.push('\n');
+    }
+    out.push_str("]\n");
+    out
+}
+
+fn component_json(
+    comp: usize,
+    members: &[Vec<usize>],
+    comp_deps: &[Vec<usize>],
+    plan: &Plan,
+    indent: usize,
+) -> String {
+    let pad = "  ".repeat(indent);
+    let child_pad = "  ".repeat(indent + 1);
+    let ids = members[comp]
+        .iter()
+        .map(|&c| {
+            plan.nodes[c]
+                .name
+                .clone()
+                .unwrap_or_else(|| plan.nodes[c].display.clone())
+        })
+        .collect::<Vec<_>>();
+
+    let mut out = String::new();
+    if ids.len() > 1 {
+        out.push_str(&format!("{pad}{{ \"mutual\": ["));
+        for (i, id) in ids.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(&format!("\"{}\"", esc_json(id)));
+        }
+        out.push_str("], \"deps\": [");
+    } else {
+        out.push_str(&format!(
+            "{pad}{{ \"decl\": \"{}\", \"deps\": [",
+            esc_json(&ids[0])
+        ));
+    }
+
+    if comp_deps[comp].is_empty() {
+        out.push_str("] }");
+        return out;
+    }
+
+    out.push('\n');
+    for (i, dep_comp) in comp_deps[comp].iter().enumerate() {
+        out.push_str(&component_json(
+            *dep_comp,
+            members,
+            comp_deps,
+            plan,
+            indent + 1,
+        ));
+        if i + 1 != comp_deps[comp].len() {
+            out.push(',');
+        }
+        out.push('\n');
+    }
+    out.push_str(&format!("{child_pad}] }}"));
     out
 }
 
@@ -79,7 +212,10 @@ pub fn html_diff(plan: &Plan, title: &str) -> String {
     svg += &format!(
         "<svg width=\"{width:.0}\" height=\"{height:.0}\" xmlns=\"http://www.w3.org/2000/svg\" font-family=\"ui-monospace,Menlo,Consolas,monospace\" font-size=\"13\">\n"
     );
-    svg += &format!("<text x=\"{left_x:.0}\" y=\"26\" font-size=\"15\" font-weight=\"700\">{}</text>\n", esc_xml(title));
+    svg += &format!(
+        "<text x=\"{left_x:.0}\" y=\"26\" font-size=\"15\" font-weight=\"700\">{}</text>\n",
+        esc_xml(title)
+    );
     svg += &format!("<text x=\"{left_x:.0}\" y=\"50\" font-weight=\"700\">BEFORE</text>\n");
     svg += &format!("<text x=\"{right_x:.0}\" y=\"50\" font-weight=\"700\">AFTER</text>\n");
 

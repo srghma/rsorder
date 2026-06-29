@@ -37,7 +37,10 @@ pub fn after(model: &FileModel, ord: &Ordering) -> String {
             let comp = ord.comp_of[idx];
             grp += 1;
             out.push_str(&format!("  subgraph mutual_{grp}[\"mutual\"]\n"));
-            while i < ord.order.len() && ord.in_mutual[ord.order[i]] && ord.comp_of[ord.order[i]] == comp {
+            while i < ord.order.len()
+                && ord.in_mutual[ord.order[i]]
+                && ord.comp_of[ord.order[i]] == comp
+            {
                 let m = ord.order[i];
                 out.push_str(&format!("    N{m}[\"{}\"]\n", esc(&items[m].display)));
                 i += 1;
@@ -106,11 +109,17 @@ pub fn diff(model: &FileModel, ord: &Ordering) -> String {
 pub fn diff_table(model: &FileModel, ord: &Ordering) -> String {
     let items = &model.items;
     let n = items.len();
-    let width = items.iter().map(|i| i.display.len()).max().unwrap_or(10).min(44);
+    let width = items
+        .iter()
+        .map(|i| i.display.len())
+        .max()
+        .unwrap_or(10)
+        .min(44);
     let mut out = String::new();
     out.push_str(&format!(
         "  {:<width$}     {:<width$}\n",
-        "BEFORE", "AFTER",
+        "BEFORE",
+        "AFTER",
         width = width
     ));
     out.push_str(&format!("  {}\n", "-".repeat(width * 2 + 5)));

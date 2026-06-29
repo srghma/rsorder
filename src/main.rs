@@ -6,15 +6,14 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use rsorder::order::{OrderOpts, Tie};
-use rsorder::{check, render, reorder, Outcome};
+use rsorder::{Outcome, check, render, reorder};
 
 #[derive(Clone)]
 struct Cli {
     mode: Mode,
     patterns: Vec<String>,
-    inside_alpha: bool,
-    outside_topological: bool,
-    outside_alpha: bool,
+    inside: Tie,
+    outside: Tie,
     mermaid_before: bool,
     mermaid_after: bool,
     html_diff: bool,
@@ -35,17 +34,15 @@ rsorder - reorder Rust items definition-before-use, wrap mutual cycles
 USAGE:
     rsorder reorder [OPTIONS] <GLOB>...
     rsorder check [OPTIONS] <GLOB>...
-    rsorder [OPTIONS] <GLOB>...
 
 ORDERING:
-        --same-level-inside-of-mutual--alphabetically
-        --same-level-outside-of-mutual--alphabetically
-        --same-level-outside-of-mutual--topological
+        --sorting-non-mutual=original|alphabetical|topological
+        --sorting-inside-mutual=original|alphabetical
             Set the global ordering policy; a `// TO REORDER <opts>` region
             header overrides it. The default is original order for ties.
 
 MODES:
-    reorder is the default and rewrites/dry-runs reordered source.
+    reorder rewrites/dry-runs reordered source.
     check reports and exits nonzero when an item uses a later non-mutual item.
 
 SCOPED MODE:
@@ -65,6 +62,10 @@ OUTPUTS (written under a per-run temp dir, opened with xdg-open):
 fn parse_cli() -> Cli {
     let mut args = std::env::args().skip(1).peekable();
     let mode = match args.peek().map(String::as_str) {
+        Some("-h" | "--help") => {
+            println!("{USAGE}");
+            std::process::exit(0);
+        }
         Some("reorder") => {
             let _ = args.next();
             Mode::Reorder
@@ -73,14 +74,20 @@ fn parse_cli() -> Cli {
             let _ = args.next();
             Mode::Check
         }
-        _ => Mode::Reorder,
+        Some(other) => {
+            eprintln!("error: expected command `reorder` or `check`, got `{other}`\n\n{USAGE}");
+            std::process::exit(2);
+        }
+        None => {
+            eprintln!("error: command `reorder` or `check` is required\n\n{USAGE}");
+            std::process::exit(2);
+        }
     };
     let mut c = Cli {
         mode,
         patterns: vec![],
-        inside_alpha: false,
-        outside_topological: false,
-        outside_alpha: false,
+        inside: Tie::Original,
+        outside: Tie::Original,
         mermaid_before: false,
         mermaid_after: false,
         html_diff: false,
@@ -94,9 +101,14 @@ fn parse_cli() -> Cli {
                 println!("{USAGE}");
                 std::process::exit(0);
             }
-            "--same-level-inside-of-mutual--alphabetically" => c.inside_alpha = true,
-            "--same-level-outside-of-mutual--alphabetically" => c.outside_alpha = true,
-            "--same-level-outside-of-mutual--topological" => c.outside_topological = true,
+            s if s.starts_with("--sorting-non-mutual=") => {
+                let value = s.trim_start_matches("--sorting-non-mutual=");
+                c.outside = parse_non_mutual_sorting(value);
+            }
+            s if s.starts_with("--sorting-inside-mutual=") => {
+                let value = s.trim_start_matches("--sorting-inside-mutual=");
+                c.inside = parse_inside_mutual_sorting(value);
+            }
             "--mermaid-write-before" => c.mermaid_before = true,
             "--mermaid-write-after" => c.mermaid_after = true,
             "--write-html-before-after-diff-table" => c.html_diff = true,
@@ -114,13 +126,34 @@ fn parse_cli() -> Cli {
         eprintln!("error: at least one glob pattern is required\n\n{USAGE}");
         std::process::exit(2);
     }
-    if c.outside_alpha && c.outside_topological {
-        eprintln!(
-            "error: choose only one outside-mutual ordering mode\n\n{USAGE}"
-        );
-        std::process::exit(2);
-    }
     c
+}
+
+fn parse_non_mutual_sorting(value: &str) -> Tie {
+    match value {
+        "original" => Tie::Original,
+        "alphabetical" => Tie::Alphabetical,
+        "topological" => Tie::Topological,
+        _ => {
+            eprintln!(
+                "error: invalid --sorting-non-mutual value `{value}`; expected original, alphabetical, or topological\n\n{USAGE}"
+            );
+            std::process::exit(2);
+        }
+    }
+}
+
+fn parse_inside_mutual_sorting(value: &str) -> Tie {
+    match value {
+        "original" => Tie::Original,
+        "alphabetical" => Tie::Alphabetical,
+        _ => {
+            eprintln!(
+                "error: invalid --sorting-inside-mutual value `{value}`; expected original or alphabetical\n\n{USAGE}"
+            );
+            std::process::exit(2);
+        }
+    }
 }
 
 // ----- tiny ANSI palette -----
@@ -136,11 +169,21 @@ impl Paint {
             s.to_string()
         }
     }
-    fn bold(&self, s: &str) -> String { self.w(s, "1") }
-    fn green(&self, s: &str) -> String { self.w(s, "32") }
-    fn yellow(&self, s: &str) -> String { self.w(s, "33") }
-    fn cyan(&self, s: &str) -> String { self.w(s, "36") }
-    fn dim(&self, s: &str) -> String { self.w(s, "2") }
+    fn bold(&self, s: &str) -> String {
+        self.w(s, "1")
+    }
+    fn green(&self, s: &str) -> String {
+        self.w(s, "32")
+    }
+    fn yellow(&self, s: &str) -> String {
+        self.w(s, "33")
+    }
+    fn cyan(&self, s: &str) -> String {
+        self.w(s, "36")
+    }
+    fn dim(&self, s: &str) -> String {
+        self.w(s, "2")
+    }
 }
 
 struct FileReport {
@@ -176,23 +219,15 @@ async fn main() {
     let xdg = in_path("xdg-open");
 
     let opts = OrderOpts {
-        inside: if cli.inside_alpha { Tie::Alphabetical } else { Tie::Original },
-        outside: if cli.outside_alpha {
-            Tie::Alphabetical
-        } else if cli.outside_topological {
-            Tie::Topological
-        } else {
-            Tie::Original
-        },
+        inside: cli.inside,
+        outside: cli.outside,
     };
 
     let mut set = tokio::task::JoinSet::new();
     for path in files.clone() {
         let cli = cli.clone();
         let tmp_dir = tmp_dir.clone();
-        set.spawn(async move {
-            process_file(path, cli, opts, tmp_dir, mmdr, xdg, paint).await
-        });
+        set.spawn(async move { process_file(path, cli, opts, tmp_dir, mmdr, xdg, paint).await });
     }
 
     let mut reports: Vec<FileReport> = Vec::new();
@@ -243,11 +278,10 @@ async fn process_file(
     }
 
     // CPU-bound transform off the async runtime.
-    let outcome: Result<Outcome, String> = tokio::task::spawn_blocking(move || {
-        reorder(&src, opts).map_err(|e| e.to_string())
-    })
-    .await
-    .ok()?;
+    let outcome: Result<Outcome, String> =
+        tokio::task::spawn_blocking(move || reorder(&src, opts).map_err(|e| e.to_string()))
+            .await
+            .ok()?;
 
     let mut lines = vec![paint.bold(&format!("=== {} ===", path.display()))];
 
@@ -337,9 +371,16 @@ async fn process_file(
         .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
         .join(", ");
-    lines.push(format!("  items:            {} ({kinds})", plan.nodes.len()));
+    lines.push(format!(
+        "  items:            {} ({kinds})",
+        plan.nodes.len()
+    ));
     lines.push(format!("  dependency edges: {}", plan.edges));
-    lines.push(format!("  items moved:      {} / {}", plan.moved, plan.nodes.len()));
+    lines.push(format!(
+        "  items moved:      {} / {}",
+        plan.moved,
+        plan.nodes.len()
+    ));
     lines.push(format!("  mutual groups:    {}", plan.mutual_groups.len()));
     for (gi, g) in plan.mutual_groups.iter().enumerate() {
         let members = g
@@ -352,7 +393,11 @@ async fn process_file(
             })
             .collect::<Vec<_>>()
             .join(", ");
-        lines.push(format!("    mutual #{:<2} ({}): {members}", gi + 1, g.len()));
+        lines.push(format!(
+            "    mutual #{:<2} ({}): {members}",
+            gi + 1,
+            g.len()
+        ));
     }
 
     Some(FileReport {
@@ -419,7 +464,6 @@ async fn process_check(path: PathBuf, src: String, paint: Paint) -> Option<FileR
     }
 }
 
-
 /// Render a .mermaid file to .svg with `mmdr` if available; return the svg path.
 async fn render_mermaid(mermaid: &Path, mmdr: bool) -> Option<PathBuf> {
     if !mmdr {
@@ -427,7 +471,14 @@ async fn render_mermaid(mermaid: &Path, mmdr: bool) -> Option<PathBuf> {
     }
     let svg = mermaid.with_extension("svg");
     let ok = tokio::process::Command::new("mmdr")
-        .args(["-i", &mermaid.to_string_lossy(), "-o", &svg.to_string_lossy(), "-e", "svg"])
+        .args([
+            "-i",
+            &mermaid.to_string_lossy(),
+            "-o",
+            &svg.to_string_lossy(),
+            "-e",
+            "svg",
+        ])
         .status()
         .await
         .map(|s| s.success())

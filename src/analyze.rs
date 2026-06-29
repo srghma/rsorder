@@ -8,7 +8,7 @@ use proc_macro2::TokenTree;
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 
-use crate::model::{classify, Item};
+use crate::model::{Item, classify};
 use crate::order::Tie;
 
 /// Per-region option overrides. `None` means "inherit the global setting".
@@ -123,7 +123,9 @@ pub fn parse(src: &str) -> syn::Result<FileModel> {
     let regions = regions_spans
         .into_iter()
         .filter_map(|(s, e)| {
-            let first = items.iter().position(|it| it.byte_start > s.line_start && it.byte_start < e.line_start)?;
+            let first = items
+                .iter()
+                .position(|it| it.byte_start > s.line_start && it.byte_start < e.line_start)?;
             let last_excl = items
                 .iter()
                 .rposition(|it| it.byte_start > s.line_start && it.byte_start < e.line_start)
@@ -138,7 +140,12 @@ pub fn parse(src: &str) -> syn::Result<FileModel> {
         })
         .collect();
 
-    Ok(FileModel { preamble, postamble, items, regions })
+    Ok(FileModel {
+        preamble,
+        postamble,
+        items,
+        regions,
+    })
 }
 
 fn scan_markers(src: &str) -> Vec<Marker> {
@@ -150,9 +157,19 @@ fn scan_markers(src: &str) -> Vec<Marker> {
             let rest = rest.trim();
             let raw = line.trim_end_matches(['\n', '\r']).to_string();
             if rest == "END" {
-                out.push(Marker { line_start: off, is_end: true, raw, opts: RegionOpts::default() });
+                out.push(Marker {
+                    line_start: off,
+                    is_end: true,
+                    raw,
+                    opts: RegionOpts::default(),
+                });
             } else {
-                out.push(Marker { line_start: off, is_end: false, raw, opts: parse_opts(rest) });
+                out.push(Marker {
+                    line_start: off,
+                    is_end: false,
+                    raw,
+                    opts: parse_opts(rest),
+                });
             }
         }
         off += line.len();
@@ -161,17 +178,24 @@ fn scan_markers(src: &str) -> Vec<Marker> {
 }
 
 fn parse_opts(rest: &str) -> RegionOpts {
-    rest.split_whitespace().fold(RegionOpts::default(), |mut o, tok| {
-        match tok {
-            "same-level-inside-of-mutual--alphabetically" => o.inside = Some(Tie::Alphabetical),
-            "same-level-inside-of-mutual--original" => o.inside = Some(Tie::Original),
-            "same-level-outside-of-mutual--alphabetically" => o.outside = Some(Tie::Alphabetical),
-            "same-level-outside-of-mutual--original" => o.outside = Some(Tie::Original),
-            "same-level-outside-of-mutual--topological" => o.outside = Some(Tie::Topological),
-            _ => {}
-        }
-        o
-    })
+    rest.split_whitespace()
+        .fold(RegionOpts::default(), |mut o, tok| {
+            if let Some(value) = tok.strip_prefix("sorting-inside-mutual=") {
+                match value {
+                    "alphabetical" => o.inside = Some(Tie::Alphabetical),
+                    "original" => o.inside = Some(Tie::Original),
+                    _ => {}
+                }
+            } else if let Some(value) = tok.strip_prefix("sorting-non-mutual=") {
+                match value {
+                    "alphabetical" => o.outside = Some(Tie::Alphabetical),
+                    "topological" => o.outside = Some(Tie::Topological),
+                    "original" => o.outside = Some(Tie::Original),
+                    _ => {}
+                }
+            }
+            o
+        })
 }
 
 /// Pair start/end markers sequentially (non-nested), yielding (start, end).
@@ -224,7 +248,10 @@ fn split_gap(gap: &str) -> (String, String) {
 }
 
 fn collect_refs(item: &syn::Item, defined: &HashSet<String>) -> HashSet<String> {
-    let mut c = RefCollector { defined, found: HashSet::new() };
+    let mut c = RefCollector {
+        defined,
+        found: HashSet::new(),
+    };
     c.visit_item(item);
     c.found
 }
@@ -253,7 +280,9 @@ impl<'a, 'ast> Visit<'ast> for RefCollector<'a> {
     fn visit_path(&mut self, p: &'ast syn::Path) {
         for seg in &p.segments {
             let id = seg.ident.to_string();
-            if !matches!(id.as_str(), "crate" | "self" | "Self" | "super") && self.defined.contains(&id) {
+            if !matches!(id.as_str(), "crate" | "self" | "Self" | "super")
+                && self.defined.contains(&id)
+            {
                 self.found.insert(id);
             }
         }

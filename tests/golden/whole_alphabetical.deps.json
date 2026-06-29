@@ -1,0 +1,15 @@
+[
+  { "decl": "Config", "deps": [] },
+  { "decl": "Helper", "deps": [] },
+  { "decl": "SCALE", "deps": [] },
+  { "decl": "impl Helper", "deps": [
+    { "decl": "Helper", "deps": [] },
+    { "decl": "SCALE", "deps": [] }
+    ] },
+  { "mutual": ["ping", "pong"], "deps": [] },
+  { "decl": "run", "deps": [
+    { "decl": "Config", "deps": [] },
+    { "decl": "Helper", "deps": [] },
+    { "mutual": ["ping", "pong"], "deps": [] }
+    ] }
+]

@@ -9,7 +9,7 @@ pub mod render;
 
 use std::collections::HashMap;
 
-use order::{order_scope, OrderOpts};
+use order::{OrderOpts, order_scope};
 
 /// A reorderable node, as seen by the renderers (compact index space).
 #[derive(Debug, Clone)]
@@ -59,7 +59,9 @@ pub struct CheckReport {
 }
 
 impl CheckReport {
-    pub fn is_ok(&self) -> bool { self.violations.is_empty() }
+    pub fn is_ok(&self) -> bool {
+        self.violations.is_empty()
+    }
 }
 
 /// Validate that every non-mutual dependency is declared before the item that
@@ -82,7 +84,10 @@ pub fn check(src: &str) -> syn::Result<CheckReport> {
         &reorderable,
         &deps_g,
         &names,
-        OrderOpts { inside: order::Tie::Original, outside: order::Tie::Original },
+        OrderOpts {
+            inside: order::Tie::Original,
+            outside: order::Tie::Original,
+        },
     );
     let mut group_of = HashMap::new();
     for (gid, group) in groups.iter().enumerate() {
@@ -129,7 +134,11 @@ pub fn reorder(src: &str, global: OrderOpts) -> syn::Result<Outcome> {
         .filter(|(_, it)| !it.pinned)
         .map(|(i, _)| i)
         .collect();
-    let g2c: HashMap<usize, usize> = reorderable.iter().enumerate().map(|(c, &g)| (g, c)).collect();
+    let g2c: HashMap<usize, usize> = reorderable
+        .iter()
+        .enumerate()
+        .map(|(c, &g)| (g, c))
+        .collect();
 
     // group_of keyed by global id, built from each scope's mutual groups.
     let mut group_of_g: HashMap<usize, i64> = HashMap::new();
@@ -166,13 +175,24 @@ pub fn reorder(src: &str, global: OrderOpts) -> syn::Result<Outcome> {
             .collect::<Vec<_>>()
             .join("\n\n");
         push_nonempty(&mut segs, &floating);
-        segs.extend(emit_ordered(&order, &group_of_g, items, false, &g2c, &mut after_g));
+        segs.extend(emit_ordered(
+            &order,
+            &group_of_g,
+            items,
+            false,
+            &g2c,
+            &mut after_g,
+        ));
         push_nonempty(&mut segs, model.postamble.trim());
         new_src = join(segs);
     } else {
         // ---- scoped mode: reorder only inside regions, everything else fixed ----
-        let region_at: HashMap<usize, usize> =
-            model.regions.iter().enumerate().map(|(ri, r)| (r.first, ri)).collect();
+        let region_at: HashMap<usize, usize> = model
+            .regions
+            .iter()
+            .enumerate()
+            .map(|(ri, r)| (r.first, ri))
+            .collect();
         let region_orders: Vec<(Vec<usize>, Vec<Vec<usize>>)> = model
             .regions
             .iter()
@@ -197,7 +217,14 @@ pub fn reorder(src: &str, global: OrderOpts) -> syn::Result<Outcome> {
                 let r = &model.regions[ri];
                 segs.push(r.start_line.clone());
                 let (order, _) = &region_orders[ri];
-                segs.extend(emit_ordered(order, &group_of_g, items, true, &g2c, &mut after_g));
+                segs.extend(emit_ordered(
+                    order,
+                    &group_of_g,
+                    items,
+                    true,
+                    &g2c,
+                    &mut after_g,
+                ));
                 segs.push(r.end_line.clone());
                 i = r.last_excl;
             } else {
@@ -217,11 +244,19 @@ pub fn reorder(src: &str, global: OrderOpts) -> syn::Result<Outcome> {
     // Build the compact plan.
     let nodes: Vec<Node> = reorderable
         .iter()
-        .map(|&g| Node { display: items[g].display.clone(), name: items[g].name.clone() })
+        .map(|&g| Node {
+            display: items[g].display.clone(),
+            name: items[g].name.clone(),
+        })
         .collect();
     let deps: Vec<Vec<usize>> = reorderable
         .iter()
-        .map(|&g| deps_g[g].iter().filter_map(|d| g2c.get(d).copied()).collect())
+        .map(|&g| {
+            deps_g[g]
+                .iter()
+                .filter_map(|d| g2c.get(d).copied())
+                .collect()
+        })
         .collect();
     let before: Vec<usize> = (0..reorderable.len()).collect();
     let after: Vec<usize> = after_g.iter().map(|g| g2c[g]).collect();
@@ -236,7 +271,10 @@ pub fn reorder(src: &str, global: OrderOpts) -> syn::Result<Outcome> {
     let kind_counts = kind_counts(items);
     let edges = deps.iter().map(Vec::len).sum();
     let pos_after: HashMap<usize, usize> = after.iter().enumerate().map(|(p, &c)| (c, p)).collect();
-    let moved = before.iter().filter(|&&c| pos_after.get(&c) != Some(&c)).count();
+    let moved = before
+        .iter()
+        .filter(|&&c| pos_after.get(&c) != Some(&c))
+        .count();
 
     Ok(Outcome {
         new_src,
@@ -271,7 +309,11 @@ fn push_nonempty(segs: &mut Vec<String>, s: &str) {
 }
 
 fn join(segs: Vec<String>) -> String {
-    let mut out = segs.into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n\n");
+    let mut out = segs
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
     out.push('\n');
     out
 }

@@ -109,5 +109,65 @@ warning: `rsorder` (bin "rsorder") generated 1 warning
 
 8. add e2e golden tests
 
+---------------
 
-```
+
+1. disallow calling rsorder program without command (should be no default)
+
+2. when I do
+
+~/projects/lean4  ⇅ rust-rewrite ✚  rsorder check src/rust/runtime/src/**/*.rs
+=== src/rust/runtime/src/leanh_extra.rs ===
+dry run — pass --write to apply
+summary:
+   items:            168 (const=14, fn=147, macro-call=1, static=1, struct=3, type=2, use=6)
+   dependency edges: 188
+   items moved:      22 / 168
+   mutual groups:    0
+
+=== src/rust/runtime/src/lib.rs ===
+dry run — pass --write to apply
+summary:
+   items:            3 (mod=3, use=1)
+   dependency edges: 0
+   items moved:      0 / 3
+   mutual groups:    0
+
+totals
+   files:         2
+   changed:       2
+   items ordered: 171
+   items moved:   22
+   mutual groups: 0
+
+
+it should not show items moved
+
+it should show list of declarations which are used before being declared
+
+how? You parse
+
+decl1 body
+decl2 body
+
+then make a graph of dependencies. then You find out that e.g. decl2 is used in body of decl1 -> violation. notice that no reordering is used (alphabetic, original, topologicla) . if at least one violation then return code 1.
+
+3.
+
+         --same-level-inside-of-mutual--alphabetically
+         --same-level-outside-of-mutual--alphabetically
+
+         change to
+
+         --sorting-non-mutual={ alphabetical, topological, original }
+         --sorting-inside-mutual={ alphabetical, original }
+
+same if declared inside of comments block . original is default
+
+4. add tests for ordering
+
+use golden tests, test all 3 orderings
+
+also during testing should golden test the json of tree of dependencies . it should be Tree DeclId , but inside of this tree some nodes can be a mutual block, which is just Array DeclId
+
+5. the input of golden tests . e.g. const WHOLE_BASIC: &str = r#"use std::collections::HashMap; should be read from file too
