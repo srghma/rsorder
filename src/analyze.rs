@@ -1,6 +1,6 @@
-//! Turn a source string into a `FileModel`: a verbatim preamble, pinned items,
-//! reorderable items (each with attached comments + dependency edges), floating
-//! comments, and a postamble. Nothing in the source is dropped.
+//! Parse a source string into a `FileModel`: verbatim preamble/postamble,
+//! source-ordered items (with attached comments + dependency edges), and any
+//! `// TO REORDER [opts]` ... `// TO REORDER END` regions. Nothing is dropped.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -8,194 +8,222 @@ use proc_macro2::TokenTree;
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 
-use crate::model::{classify, Item, ItemKind};
+use crate::model::{classify, Item};
+use crate::order::Tie;
 
-pub struct FileModel {
-    /// Bytes before the first item (license header, inner attrs, etc.) — verbatim.
-    pub preamble: String,
-    /// Comment blocks that sat between items separated by blank lines.
-    pub floating: Vec<String>,
-    /// Pinned items (use / extern crate) kept in original order.
-    pub pinned: Vec<Item>,
-    /// Reorderable items in original source order (index == order id).
-    pub items: Vec<Item>,
-    /// Trailing bytes after the last item — verbatim.
-    pub postamble: String,
+/// Per-region option overrides. `None` means "inherit the global setting".
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RegionOpts {
+    pub inside: Option<Tie>,
+    pub outside: Option<Tie>,
 }
 
-struct Raw {
-    kind: ItemKind,
-    name: Option<String>,
-    display: String,
-    start: usize,
-    end: usize,
-    pinned: bool,
-    item: syn::Item,
+#[derive(Debug, Clone)]
+pub struct Region {
+    pub start_line: String,
+    pub end_line: String,
+    pub opts: RegionOpts,
+    /// Contiguous range of `items` indices that fall inside the region.
+    pub first: usize,
+    pub last_excl: usize,
+}
+
+pub struct FileModel {
+    pub preamble: String,
+    pub postamble: String,
+    pub items: Vec<Item>,
+    pub regions: Vec<Region>,
+}
+
+struct Marker {
+    line_start: usize,
+    is_end: bool,
+    raw: String,
+    opts: RegionOpts,
 }
 
 pub fn parse(src: &str) -> syn::Result<FileModel> {
     let file = syn::parse_file(src)?;
 
-    // 1. Collect raw items with byte spans, in source order.
-    let mut raws: Vec<Raw> = Vec::new();
-    for item in &file.items {
-        let (kind, name, display, pinned) = classify(item);
-        let range = item.span().byte_range();
-        raws.push(Raw {
-            kind,
-            name,
-            display,
-            start: range.start,
-            end: range.end,
-            pinned,
-            item: item.clone(),
-        });
-    }
-    raws.sort_by_key(|r| r.start);
+    // --- raw items with byte spans, sorted by source position ---
+    let mut raws: Vec<(syn::Item, usize, usize)> = file
+        .items
+        .iter()
+        .map(|it| {
+            let r = it.span().byte_range();
+            (it.clone(), r.start, r.end)
+        })
+        .collect();
+    raws.sort_by_key(|r| r.1);
 
-    // 2. Preamble / postamble / per-item leading comments.
-    let preamble = if let Some(first) = raws.first() {
-        strip_markers(&src[..first.start])
-    } else {
-        strip_markers(src)
-    };
-    let postamble = if let Some(last) = raws.last() {
-        strip_markers(&src[last.end..])
-    } else {
-        String::new()
-    };
+    // --- scan TO REORDER markers (line-based) ---
+    let markers = scan_markers(src);
+    let regions_spans = pair_markers(&markers);
 
-    let mut leads: Vec<String> = vec![String::new(); raws.len()];
-    let mut floating: Vec<String> = Vec::new();
+    // --- preamble / postamble / leads / floating ---
+    let preamble = raws
+        .first()
+        .map(|f| strip_markers(&src[..f.1]))
+        .unwrap_or_else(|| strip_markers(src));
+    let postamble = raws
+        .last()
+        .map(|l| strip_markers(&src[l.2..]))
+        .unwrap_or_default();
+
+    let mut leads = vec![String::new(); raws.len()];
+    let mut floats = vec![String::new(); raws.len()];
     for i in 1..raws.len() {
-        let gap = &src[raws[i - 1].end..raws[i].start];
-        let (attached, floats) = split_gap(gap);
+        let (attached, floating) = split_gap(&src[raws[i - 1].2..raws[i].1]);
         leads[i] = strip_markers(&attached);
-        let floats = strip_markers(&floats);
-        if !floats.trim().is_empty() {
-            floating.push(floats);
-        }
+        floats[i] = strip_markers(&floating);
     }
 
-    // 3. Build the name -> reorderable-index map first (needed for dep edges).
-    let mut order_index: HashMap<String, usize> = HashMap::new();
-    let mut next_order = 0usize;
-    let mut order_of_raw: Vec<Option<usize>> = Vec::with_capacity(raws.len());
-    for r in &raws {
-        if r.pinned {
-            order_of_raw.push(None);
-        } else {
-            let oid = next_order;
-            next_order += 1;
-            if let Some(n) = &r.name {
-                order_index.insert(n.clone(), oid);
+    // --- name map for dependency edges (named, non-pinned items) ---
+    let classified: Vec<_> = raws.iter().map(|(it, _, _)| classify(it)).collect();
+    let name_to_idx: HashMap<String, usize> = classified
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, _, _, pinned))| !pinned)
+        .filter_map(|(i, (_, name, _, _))| name.clone().map(|n| (n, i)))
+        .collect();
+    let defined: HashSet<String> = name_to_idx.keys().cloned().collect();
+
+    // --- assemble items with dependency edges ---
+    let items: Vec<Item> = raws
+        .iter()
+        .enumerate()
+        .map(|(i, (item, start, end))| {
+            let (kind, name, display, pinned) = classified[i].clone();
+            let deps: Vec<usize> = if pinned {
+                Vec::new()
+            } else {
+                collect_refs(item, &defined)
+                    .into_iter()
+                    .filter_map(|n| name_to_idx.get(&n).copied())
+                    .filter(|&t| t != i)
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect()
+            };
+            Item {
+                kind,
+                name,
+                display,
+                lead: leads[i].clone(),
+                pre_floating: floats[i].clone(),
+                body: src[*start..*end].trim_end().to_string(),
+                byte_start: *start,
+                deps,
+                pinned,
             }
-            order_of_raw.push(Some(oid));
-        }
-    }
-    let defined: HashSet<String> = order_index.keys().cloned().collect();
+        })
+        .collect();
 
-    // 4. Assemble items, computing dependency edges for reorderable ones.
-    let mut pinned_items: Vec<Item> = Vec::new();
-    let mut items: Vec<Item> = vec![
-        Item {
-            kind: ItemKind::Other,
-            name: None,
-            display: String::new(),
-            lead: String::new(),
-            body: String::new(),
-            deps: Vec::new(),
-            pinned: false,
-        };
-        next_order
-    ];
+    // --- map marker byte-spans to contiguous item index ranges ---
+    let regions = regions_spans
+        .into_iter()
+        .filter_map(|(s, e)| {
+            let first = items.iter().position(|it| it.byte_start > s.line_start && it.byte_start < e.line_start)?;
+            let last_excl = items
+                .iter()
+                .rposition(|it| it.byte_start > s.line_start && it.byte_start < e.line_start)
+                .map(|p| p + 1)?;
+            Some(Region {
+                start_line: s.raw.clone(),
+                end_line: e.raw.clone(),
+                opts: s.opts,
+                first,
+                last_excl,
+            })
+        })
+        .collect();
 
-    for (i, r) in raws.iter().enumerate() {
-        let body = src[r.start..r.end].trim_end().to_string();
-        let lead = leads[i].clone();
-        if r.pinned {
-            pinned_items.push(Item {
-                kind: r.kind,
-                name: r.name.clone(),
-                display: r.display.clone(),
-                lead,
-                body,
-                deps: Vec::new(),
-                pinned: true,
-            });
-            continue;
-        }
-        let oid = order_of_raw[i].unwrap();
-        let used = collect_refs(&r.item, &defined);
-        let mut deps: BTreeSet<usize> = BTreeSet::new();
-        for name in used {
-            if let Some(&target) = order_index.get(&name) {
-                if target != oid {
-                    deps.insert(target);
-                }
+    Ok(FileModel { preamble, postamble, items, regions })
+}
+
+fn scan_markers(src: &str) -> Vec<Marker> {
+    let mut out = Vec::new();
+    let mut off = 0usize;
+    for line in src.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("// TO REORDER") {
+            let rest = rest.trim();
+            let raw = line.trim_end_matches(['\n', '\r']).to_string();
+            if rest == "END" {
+                out.push(Marker { line_start: off, is_end: true, raw, opts: RegionOpts::default() });
+            } else {
+                out.push(Marker { line_start: off, is_end: false, raw, opts: parse_opts(rest) });
             }
         }
-        items[oid] = Item {
-            kind: r.kind,
-            name: r.name.clone(),
-            display: r.display.clone(),
-            lead,
-            body,
-            deps: deps.into_iter().collect(),
-            pinned: false,
-        };
+        off += line.len();
     }
+    out
+}
 
-    Ok(FileModel {
-        preamble,
-        floating,
-        pinned: pinned_items,
-        items,
-        postamble,
+fn parse_opts(rest: &str) -> RegionOpts {
+    rest.split_whitespace().fold(RegionOpts::default(), |mut o, tok| {
+        match tok {
+            "same-level-inside-of-mutual--alphabetically" => o.inside = Some(Tie::Alphabetical),
+            "same-level-inside-of-mutual--original" => o.inside = Some(Tie::Original),
+            "same-level-outside-of-mutual--alphabetically" => o.outside = Some(Tie::Alphabetical),
+            "same-level-outside-of-mutual--original" => o.outside = Some(Tie::Original),
+            _ => {}
+        }
+        o
     })
 }
 
-/// Remove the tool's own `// mutual start` / `// mutual end` marker lines so the
-/// transformation is idempotent (markers are re-derived from the graph).
+/// Pair start/end markers sequentially (non-nested), yielding (start, end).
+fn pair_markers(markers: &[Marker]) -> Vec<(&Marker, &Marker)> {
+    let mut stack: Vec<&Marker> = Vec::new();
+    let mut regions = Vec::new();
+    for m in markers {
+        if m.is_end {
+            if let Some(start) = stack.pop() {
+                regions.push((start, m));
+            }
+        } else {
+            stack.push(m);
+        }
+    }
+    regions
+}
+
+/// Strip the tool's own marker lines so the transform is idempotent.
 fn strip_markers(s: &str) -> String {
     s.lines()
         .filter(|l| {
             let t = l.trim();
-            t != "// mutual start" && t != "// mutual end"
+            t != "// mutual start" && t != "// mutual end" && !t.starts_with("// TO REORDER")
         })
         .collect::<Vec<_>>()
         .join("\n")
 }
 
-/// Split an inter-item gap into (comments attached to the following item,
-/// floating comments separated from it by a blank line).
+/// Split an inter-item gap into (comments touching the next item, floating ones).
 fn split_gap(gap: &str) -> (String, String) {
     let lines: Vec<&str> = gap.split('\n').collect();
     if lines.len() <= 1 {
         return (String::new(), String::new());
     }
-    // Drop the final element: it is the indentation on the item's own line.
     let between = &lines[..lines.len() - 1];
-    // Trailing contiguous non-blank lines attach to the item.
-    let mut start = between.len();
-    while start > 0 && !between[start - 1].trim().is_empty() {
-        start -= 1;
-    }
+    let start = (0..between.len())
+        .rev()
+        .take_while(|&i| !between[i].trim().is_empty())
+        .last()
+        .unwrap_or(between.len());
     let attached = between[start..].join("\n").trim_end().to_string();
-    let floats: Vec<&str> = between[..start]
+    let floating = between[..start]
         .iter()
         .filter(|l| !l.trim().is_empty())
         .copied()
-        .collect();
-    (attached, floats.join("\n"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    (attached, floating)
 }
 
-/// Walk an item and collect the set of defined names it references.
 fn collect_refs(item: &syn::Item, defined: &HashSet<String>) -> HashSet<String> {
-    let mut c = RefCollector {
-        defined,
-        found: HashSet::new(),
-    };
+    let mut c = RefCollector { defined, found: HashSet::new() };
     c.visit_item(item);
     c.found
 }
@@ -206,19 +234,17 @@ struct RefCollector<'a> {
 }
 
 impl<'a> RefCollector<'a> {
-    fn scan_tokens(&mut self, ts: &proc_macro2::TokenStream) {
-        for tt in ts.clone() {
-            match tt {
-                TokenTree::Ident(id) => {
-                    let s = id.to_string();
-                    if self.defined.contains(&s) {
-                        self.found.insert(s);
-                    }
+    fn scan(&mut self, ts: &proc_macro2::TokenStream) {
+        ts.clone().into_iter().for_each(|tt| match tt {
+            TokenTree::Ident(id) => {
+                let s = id.to_string();
+                if self.defined.contains(&s) {
+                    self.found.insert(s);
                 }
-                TokenTree::Group(g) => self.scan_tokens(&g.stream()),
-                _ => {}
             }
-        }
+            TokenTree::Group(g) => self.scan(&g.stream()),
+            _ => {}
+        });
     }
 }
 
@@ -232,7 +258,6 @@ impl<'a, 'ast> Visit<'ast> for RefCollector<'a> {
         }
         visit::visit_path(self, p);
     }
-
     fn visit_macro(&mut self, m: &'ast syn::Macro) {
         for seg in &m.path.segments {
             let id = seg.ident.to_string();
@@ -240,6 +265,6 @@ impl<'a, 'ast> Visit<'ast> for RefCollector<'a> {
                 self.found.insert(id);
             }
         }
-        self.scan_tokens(&m.tokens);
+        self.scan(&m.tokens);
     }
 }

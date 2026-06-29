@@ -1,293 +1,344 @@
-//! rsorder — reorder top-level Rust items so definitions precede uses,
-//! Lean-style `// mutual start/end` blocks for cycles, with Mermaid views.
-
-mod analyze;
-mod mermaid;
-mod model;
-mod order;
+//! rsorder CLI: reorder Rust items definition-before-use, Lean-style mutual
+//! blocks, scoped `// TO REORDER` regions, with HTML/Mermaid views.
 
 use std::collections::BTreeSet;
-use std::fs;
-use std::path::PathBuf;
+use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
 
-#[derive(Debug, Default)]
+use rsorder::order::{OrderOpts, Tie};
+use rsorder::{render, reorder, Outcome};
+
+#[derive(Clone)]
 struct Cli {
     patterns: Vec<String>,
-    same_level_alphabetically: bool,
+    inside_alpha: bool,
+    outside_alpha: bool,
     mermaid_before: bool,
     mermaid_after: bool,
-    mermaid_diff: bool,
+    html_diff: bool,
     write: bool,
     stdout: bool,
+    color: bool,
 }
 
 const USAGE: &str = "\
-rsorder - reorder Rust items definition-before-use, wrap mutual cycles, show graphs
+rsorder - reorder Rust items definition-before-use, wrap mutual cycles
 
 USAGE:
     rsorder [OPTIONS] <GLOB>...
 
-ARGS:
-    <GLOB>...   One or more glob patterns matching .rs files (e.g. 'src/**/*.rs')
+ORDERING:
+        --same-level-inside-of-mutual--alphabetically
+        --same-level-outside-of-mutual--alphabetically
+            Sort alphabetically (otherwise: original order). These set the
+            global policy; a `// TO REORDER <opts>` region header overrides it.
 
-OPTIONS:
-        --same-level-alphabetically   Sort items alphabetically inside a mutual
-                                       group (default: preserve original order)
-        --mermaid-before              Print Mermaid dependency graph (original order)
-        --mermaid-after               Print Mermaid dependency graph (reordered)
-        --mermaid-diff                Print before/after movement table + Mermaid
-    -w, --write                       Rewrite files in place (default: dry run)
-        --stdout                      Print reordered contents to stdout
-    -h, --help                        Show this help";
+SCOPED MODE:
+    If a file contains at least one `// TO REORDER` ... `// TO REORDER END`
+    region, ONLY the declarations inside those regions are reordered.
+
+OUTPUTS (written under a per-run temp dir, opened with xdg-open):
+        --mermaid-write-before     write <file>-before.mermaid (+ svg via mmdr)
+        --mermaid-write-after      write <file>-after.mermaid  (+ svg via mmdr)
+        --write-html-before-after-diff-table
+                                   write <file>-before-after.html and open it
+    -w, --write                    rewrite the .rs files in place
+        --stdout                   also print reordered contents to stdout
+        --no-color                 disable ANSI colors
+    -h, --help                     show this help";
 
 fn parse_cli() -> Cli {
-    let mut cli = Cli::default();
-    for arg in std::env::args().skip(1) {
-        match arg.as_str() {
+    let mut c = Cli {
+        patterns: vec![],
+        inside_alpha: false,
+        outside_alpha: false,
+        mermaid_before: false,
+        mermaid_after: false,
+        html_diff: false,
+        write: false,
+        stdout: false,
+        color: std::io::stdout().is_terminal(),
+    };
+    for a in std::env::args().skip(1) {
+        match a.as_str() {
             "-h" | "--help" => {
                 println!("{USAGE}");
                 std::process::exit(0);
             }
-            "--same-level-alphabetically" => cli.same_level_alphabetically = true,
-            "--mermaid-before" => cli.mermaid_before = true,
-            "--mermaid-after" | "--mermaid-end" => cli.mermaid_after = true,
-            "--mermaid-diff" => cli.mermaid_diff = true,
-            "-w" | "--write" => cli.write = true,
-            "--stdout" => cli.stdout = true,
-            other if other.starts_with('-') => {
-                eprintln!("unknown option: {other}\n\n{USAGE}");
+            "--same-level-inside-of-mutual--alphabetically" => c.inside_alpha = true,
+            "--same-level-outside-of-mutual--alphabetically" => c.outside_alpha = true,
+            "--mermaid-write-before" => c.mermaid_before = true,
+            "--mermaid-write-after" => c.mermaid_after = true,
+            "--write-html-before-after-diff-table" => c.html_diff = true,
+            "-w" | "--write" => c.write = true,
+            "--stdout" => c.stdout = true,
+            "--no-color" => c.color = false,
+            s if s.starts_with('-') => {
+                eprintln!("unknown option: {s}\n\n{USAGE}");
                 std::process::exit(2);
             }
-            other => cli.patterns.push(other.to_string()),
+            s => c.patterns.push(s.to_string()),
         }
     }
-    if cli.patterns.is_empty() {
+    if c.patterns.is_empty() {
         eprintln!("error: at least one glob pattern is required\n\n{USAGE}");
         std::process::exit(2);
     }
-    cli
+    c
 }
 
-fn main() {
-    let cli = parse_cli();
-
-    let mut files: BTreeSet<PathBuf> = BTreeSet::new();
-    for pat in &cli.patterns {
-        match glob::glob(pat) {
-            Ok(paths) => {
-                for entry in paths.flatten() {
-                    if entry.extension().map(|e| e == "rs").unwrap_or(false) && entry.is_file() {
-                        files.insert(entry);
-                    }
-                }
-            }
-            Err(e) => eprintln!("bad glob pattern {pat:?}: {e}"),
+// ----- tiny ANSI palette -----
+#[derive(Clone, Copy)]
+struct Paint {
+    on: bool,
+}
+impl Paint {
+    fn w(&self, s: &str, code: &str) -> String {
+        if self.on {
+            format!("\x1b[{code}m{s}\x1b[0m")
+        } else {
+            s.to_string()
         }
     }
+    fn bold(&self, s: &str) -> String { self.w(s, "1") }
+    fn green(&self, s: &str) -> String { self.w(s, "32") }
+    fn yellow(&self, s: &str) -> String { self.w(s, "33") }
+    fn cyan(&self, s: &str) -> String { self.w(s, "36") }
+    fn dim(&self, s: &str) -> String { self.w(s, "2") }
+}
+
+struct FileReport {
+    lines: Vec<String>,
+    moved: usize,
+    mutual: usize,
+    items: usize,
+    changed: bool,
+}
+
+#[tokio::main]
+async fn main() {
+    let cli = parse_cli();
+    let paint = Paint { on: cli.color };
+
+    let files: BTreeSet<PathBuf> = cli
+        .patterns
+        .iter()
+        .filter_map(|p| glob::glob(p).ok())
+        .flat_map(|paths| paths.flatten())
+        .filter(|p| p.is_file() && p.extension().map(|e| e == "rs").unwrap_or(false))
+        .collect();
 
     if files.is_empty() {
         eprintln!("no .rs files matched the given pattern(s)");
         std::process::exit(1);
     }
 
-    let mut total_items = 0usize;
-    let mut total_moved = 0usize;
-    let mut total_mutual = 0usize;
-    let mut total_changed = 0usize;
+    let tmp_dir = std::env::temp_dir().join(format!("rsorder-{}", std::process::id()));
+    let _ = tokio::fs::create_dir_all(&tmp_dir).await;
+    let mmdr = in_path("mmdr");
+    let xdg = in_path("xdg-open");
 
-    for path in &files {
-        let src = match fs::read_to_string(path) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("{}: cannot read: {e}", path.display());
-                continue;
-            }
-        };
-        let model = match analyze::parse(&src) {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("{}: parse error: {e}", path.display());
-                continue;
-            }
-        };
+    let opts = OrderOpts {
+        inside: if cli.inside_alpha { Tie::Alphabetical } else { Tie::Original },
+        outside: if cli.outside_alpha { Tie::Alphabetical } else { Tie::Original },
+    };
 
-        let deps: Vec<Vec<usize>> = model.items.iter().map(|i| i.deps.clone()).collect();
-        let names: Vec<String> = model
-            .items
-            .iter()
-            .map(|i| i.name.clone().unwrap_or_else(|| i.display.clone()))
-            .collect();
-        let ord = order::compute(&deps, &names, cli.same_level_alphabetically);
+    let mut set = tokio::task::JoinSet::new();
+    for path in files.clone() {
+        let cli = cli.clone();
+        let tmp_dir = tmp_dir.clone();
+        set.spawn(async move {
+            process_file(path, cli, opts, tmp_dir, mmdr, xdg, paint).await
+        });
+    }
 
-        let new_src = emit(&model, &ord);
-        let changed = new_src != src;
-
-        println!("=== {} ===", path.display());
-
-        if cli.mermaid_before {
-            println!("\n```mermaid");
-            print!("{}", mermaid::before(&model));
-            println!("```");
+    let mut reports: Vec<FileReport> = Vec::new();
+    while let Some(joined) = set.join_next().await {
+        if let Ok(Some(rep)) = joined {
+            reports.push(rep);
         }
-        if cli.mermaid_after {
-            println!("\n```mermaid");
-            print!("{}", mermaid::after(&model, &ord));
-            println!("```");
-        }
-        if cli.mermaid_diff {
-            println!("\nbefore/after order:");
-            print!("{}", mermaid::diff_table(&model, &ord));
-            println!("\n```mermaid");
-            print!("{}", mermaid::diff(&model, &ord));
-            println!("```");
-        }
+    }
+    reports.sort_by(|a, b| a.lines.first().cmp(&b.lines.first()));
 
-        if cli.stdout {
-            println!("\n----- reordered -----");
-            print!("{new_src}");
-            if !new_src.ends_with('\n') {
-                println!();
-            }
-            println!("----- end -----");
-        }
-
-        if cli.write {
-            if changed {
-                if let Err(e) = fs::write(path, &new_src) {
-                    eprintln!("{}: cannot write: {e}", path.display());
-                } else {
-                    println!("\n(written in place)");
-                }
-            } else {
-                println!("\n(no change)");
-            }
-        } else if !changed {
-            println!("\n(already in dependency order - no change)");
-        } else {
-            println!("\n(dry run - pass --write to apply)");
-        }
-
-        let moved = ord
-            .order
-            .iter()
-            .enumerate()
-            .filter(|(row, &idx)| *row != idx)
-            .count();
-        print_summary(&model, &ord, moved);
-
-        total_items += model.items.len();
-        total_moved += moved;
-        total_mutual += ord.mutual_groups.len();
-        if changed {
-            total_changed += 1;
+    for rep in &reports {
+        for l in &rep.lines {
+            println!("{l}");
         }
         println!();
     }
 
-    if files.len() > 1 {
-        println!("=== totals ===");
-        println!("  files:          {}", files.len());
-        println!("  changed:        {total_changed}");
-        println!("  items ordered:  {total_items}");
-        println!("  items moved:    {total_moved}");
-        println!("  mutual groups:  {total_mutual}");
+    if reports.len() > 1 {
+        let changed = reports.iter().filter(|r| r.changed).count();
+        let moved: usize = reports.iter().map(|r| r.moved).sum();
+        let mutual: usize = reports.iter().map(|r| r.mutual).sum();
+        let items: usize = reports.iter().map(|r| r.items).sum();
+        println!("{}", paint.bold("totals"));
+        println!("  files:         {}", reports.len());
+        println!("  changed:       {changed}");
+        println!("  items ordered: {items}");
+        println!("  items moved:   {moved}");
+        println!("  mutual groups: {mutual}");
     }
 }
 
-/// Render the new file from the model + ordering. Lossless except for blank-line
-/// normalisation and possible relocation of stand-alone comments.
-fn emit(model: &analyze::FileModel, ord: &order::Ordering) -> String {
-    let mut segments: Vec<String> = Vec::new();
+async fn process_file(
+    path: PathBuf,
+    cli: Cli,
+    opts: OrderOpts,
+    tmp_dir: PathBuf,
+    mmdr: bool,
+    xdg: bool,
+    paint: Paint,
+) -> Option<FileReport> {
+    let src = tokio::fs::read_to_string(&path).await.ok()?;
 
-    let pre = model.preamble.trim_end();
-    if !pre.is_empty() {
-        segments.push(pre.to_string());
+    // CPU-bound transform off the async runtime.
+    let outcome: Result<Outcome, String> = tokio::task::spawn_blocking(move || {
+        reorder(&src, opts).map_err(|e| e.to_string())
+    })
+    .await
+    .ok()?;
+
+    let mut lines = vec![paint.bold(&format!("=== {} ===", path.display()))];
+
+    let outcome = match outcome {
+        Ok(o) => o,
+        Err(e) => {
+            lines.push(paint.yellow(&format!("parse error: {e}")));
+            return Some(FileReport { lines, moved: 0, mutual: 0, items: 0, changed: false });
+        }
+    };
+
+    let original = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+    let changed = outcome.new_src != original;
+    let plan = &outcome.plan;
+
+    if plan.scoped {
+        lines.push(paint.cyan(&format!(
+            "scoped mode: found {} `// TO REORDER` region(s) — only their contents are reordered",
+            plan.region_count
+        )));
     }
 
-    for p in &model.pinned {
-        segments.push(block(&p.lead, &p.body));
-    }
+    // ----- side outputs -----
+    let stem = flat_name(&path);
+    let mut openers: Vec<PathBuf> = Vec::new();
 
-    for f in &model.floating {
-        let t = f.trim();
-        if !t.is_empty() {
-            segments.push(t.to_string());
+    if cli.mermaid_before {
+        let f = tmp_dir.join(format!("{stem}-before.mermaid"));
+        let _ = tokio::fs::write(&f, render::mermaid_before(plan)).await;
+        lines.push(paint.dim(&format!("wrote {}", f.display())));
+        if let Some(svg) = render_mermaid(&f, mmdr).await {
+            openers.push(svg);
         }
     }
+    if cli.mermaid_after {
+        let f = tmp_dir.join(format!("{stem}-after.mermaid"));
+        let _ = tokio::fs::write(&f, render::mermaid_after(plan)).await;
+        lines.push(paint.dim(&format!("wrote {}", f.display())));
+        if let Some(svg) = render_mermaid(&f, mmdr).await {
+            openers.push(svg);
+        }
+    }
+    if cli.html_diff {
+        let f = tmp_dir.join(format!("{stem}-before-after.html"));
+        let html = render::html_diff(plan, &path.display().to_string());
+        let _ = tokio::fs::write(&f, html).await;
+        lines.push(paint.dim(&format!("wrote {}", f.display())));
+        openers.push(f);
+    }
+    for f in &openers {
+        open(f, xdg).await;
+    }
 
-    let items = &model.items;
-    let mut i = 0;
-    while i < ord.order.len() {
-        let idx = ord.order[i];
-        if ord.in_mutual[idx] {
-            let comp = ord.comp_of[idx];
-            let mut group = String::from("// mutual start\n");
-            let mut first = true;
-            while i < ord.order.len()
-                && ord.in_mutual[ord.order[i]]
-                && ord.comp_of[ord.order[i]] == comp
-            {
-                let m = ord.order[i];
-                if !first {
-                    group.push_str("\n\n");
-                }
-                first = false;
-                group.push_str(&block(&items[m].lead, &items[m].body));
-                i += 1;
+    // ----- write / stdout -----
+    if cli.write {
+        if changed {
+            match tokio::fs::write(&path, &outcome.new_src).await {
+                Ok(_) => lines.push(paint.green("written in place")),
+                Err(e) => lines.push(paint.yellow(&format!("cannot write: {e}"))),
             }
-            group.push_str("\n// mutual end");
-            segments.push(group);
         } else {
-            segments.push(block(&items[idx].lead, &items[idx].body));
-            i += 1;
+            lines.push(paint.dim("no change"));
         }
-    }
-
-    let post = model.postamble.trim();
-    if !post.is_empty() {
-        segments.push(post.to_string());
-    }
-
-    let mut out = segments.join("\n\n");
-    out.push('\n');
-    out
-}
-
-fn block(lead: &str, body: &str) -> String {
-    if lead.trim().is_empty() {
-        body.to_string()
+    } else if changed {
+        lines.push(paint.dim("dry run — pass --write to apply"));
     } else {
-        format!("{}\n{}", lead.trim_end(), body)
+        lines.push(paint.dim("already in dependency order — no change"));
     }
+    if cli.stdout {
+        lines.push("----- reordered -----".to_string());
+        lines.push(outcome.new_src.trim_end().to_string());
+        lines.push("----- end -----".to_string());
+    }
+
+    // ----- summary -----
+    lines.push(paint.bold("summary:"));
+    let kinds = plan
+        .kind_counts
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    lines.push(format!("  items:            {} ({kinds})", plan.nodes.len()));
+    lines.push(format!("  dependency edges: {}", plan.edges));
+    lines.push(format!("  items moved:      {} / {}", plan.moved, plan.nodes.len()));
+    lines.push(format!("  mutual groups:    {}", plan.mutual_groups.len()));
+    for (gi, g) in plan.mutual_groups.iter().enumerate() {
+        let members = g
+            .iter()
+            .map(|&c| {
+                plan.nodes[c]
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| plan.nodes[c].display.clone())
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(format!("    mutual #{:<2} ({}): {members}", gi + 1, g.len()));
+    }
+
+    Some(FileReport {
+        lines,
+        moved: plan.moved,
+        mutual: plan.mutual_groups.len(),
+        items: plan.nodes.len(),
+        changed,
+    })
 }
 
-fn print_summary(model: &analyze::FileModel, ord: &order::Ordering, moved: usize) {
-    use std::collections::BTreeMap;
-    let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
-    for it in &model.items {
-        *counts.entry(it.kind.label()).or_default() += 1;
-    }
-    for p in &model.pinned {
-        *counts.entry(p.kind.label()).or_default() += 1;
-    }
-    let edges: usize = model.items.iter().map(|i| i.deps.len()).sum();
 
-    println!("\nsummary:");
-    let kinds: Vec<String> = counts.iter().map(|(k, v)| format!("{k}={v}")).collect();
-    println!("  items:            {} ({})", model.items.len(), kinds.join(", "));
-    println!("  dependency edges: {edges}");
-    println!("  items moved:      {moved} / {}", model.items.len());
-    println!("  mutual groups:    {}", ord.mutual_groups.len());
-    for (gi, g) in ord.mutual_groups.iter().enumerate() {
-        let members: Vec<&str> = g
-            .iter()
-            .map(|&m| {
-                model.items[m]
-                    .name
-                    .as_deref()
-                    .unwrap_or(model.items[m].display.as_str())
-            })
-            .collect();
-        println!("    mutual #{:<2} ({}): {}", gi + 1, g.len(), members.join(", "));
+/// Render a .mermaid file to .svg with `mmdr` if available; return the svg path.
+async fn render_mermaid(mermaid: &Path, mmdr: bool) -> Option<PathBuf> {
+    if !mmdr {
+        return None;
     }
+    let svg = mermaid.with_extension("svg");
+    let ok = tokio::process::Command::new("mmdr")
+        .args(["-i", &mermaid.to_string_lossy(), "-o", &svg.to_string_lossy(), "-e", "svg"])
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false);
+    ok.then_some(svg)
+}
+
+async fn open(path: &Path, xdg: bool) {
+    if !xdg {
+        return;
+    }
+    let _ = tokio::process::Command::new("xdg-open").arg(path).spawn();
+}
+
+fn in_path(bin: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
+        .unwrap_or(false)
+}
+
+/// Flatten a path into a single safe file-name stem.
+fn flat_name(path: &Path) -> String {
+    path.to_string_lossy()
+        .trim_start_matches(['.', '/', '\\'])
+        .replace(['/', '\\'], "_")
 }

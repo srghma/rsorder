@@ -1,137 +1,146 @@
-//! Order reorderable items so dependencies come first. Cycles (mutual
-//! recursion) collapse into groups emitted together inside `// mutual` markers.
+//! Ordering of a set of items so dependencies precede uses; cycles (mutual
+//! recursion) collapse into groups. Tie-breaks are configurable.
 
-use std::cmp::Reverse;
-use std::collections::{BTreeSet, BinaryHeap};
+use std::collections::BTreeSet;
 
-pub struct Ordering {
-    /// New order: a flat list of reorderable item indices.
-    pub order: Vec<usize>,
-    /// Component id for each item index.
-    pub comp_of: Vec<usize>,
-    /// For each item index, whether it lives in a mutual group (component > 1).
-    pub in_mutual: Vec<bool>,
-    /// Component id -> members in their emitted order (only multi-member comps).
-    pub mutual_groups: Vec<Vec<usize>>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Tie {
+    /// Preserve original source order among items at the same level.
+    #[default]
+    Original,
+    /// Sort alphabetically by name among items at the same level.
+    Alphabetical,
 }
 
-/// `deps[a]` = items that `a` depends on (must precede `a`).
-/// `names[i]` = a sort key used for alphabetical ordering inside mutual groups.
-pub fn compute(deps: &[Vec<usize>], names: &[String], alphabetical: bool) -> Ordering {
-    let n = deps.len();
-    let (comp_of, comps) = tarjan(n, deps);
-    let ncomp = comps.len();
+#[derive(Debug, Clone, Copy)]
+pub struct OrderOpts {
+    /// Tie-break for members within a mutual group.
+    pub inside: Tie,
+    /// Tie-break among independent items/components outside mutual groups.
+    pub outside: Tie,
+}
 
-    // Condensation edges: provider-comp -> user-comp (b precedes a when a deps b).
-    let mut edges: BTreeSet<(usize, usize)> = BTreeSet::new();
-    for a in 0..n {
-        for &b in &deps[a] {
-            let (ca, cb) = (comp_of[a], comp_of[b]);
-            if ca != cb {
-                edges.insert((cb, ca));
-            }
-        }
-    }
-    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); ncomp];
+/// Order `members` (global item indices) by their dependencies.
+/// `deps[g]` and `names[g]` are indexed by global id; only edges that stay
+/// within `members` are considered. Returns the flattened order (globals) and
+/// the multi-member mutual groups (globals).
+pub fn order_scope(
+    members: &[usize],
+    deps: &[Vec<usize>],
+    names: &[String],
+    opts: OrderOpts,
+) -> (Vec<usize>, Vec<Vec<usize>>) {
+    let mut members: Vec<usize> = members.to_vec();
+    members.sort_unstable();
+    let n = members.len();
+    let local_of: std::collections::HashMap<usize, usize> =
+        members.iter().enumerate().map(|(l, &g)| (g, l)).collect();
+
+    // Local adjacency restricted to the member set.
+    let adj: Vec<Vec<usize>> = members
+        .iter()
+        .map(|&g| {
+            deps[g]
+                .iter()
+                .filter_map(|d| local_of.get(d).copied())
+                .collect()
+        })
+        .collect();
+
+    let (comp_of, comps) = tarjan(n, &adj);
+
+    // Condensation edges provider-comp -> user-comp.
+    let edges: BTreeSet<(usize, usize)> = (0..n)
+        .flat_map(|a| adj[a].iter().map(move |&b| (a, b)))
+        .filter(|(a, b)| comp_of[*a] != comp_of[*b])
+        .map(|(a, b)| (comp_of[b], comp_of[a]))
+        .collect();
+
+    let ncomp = comps.len();
+    let mut succ = vec![Vec::new(); ncomp];
     let mut indeg = vec![0usize; ncomp];
     for &(from, to) in &edges {
         succ[from].push(to);
         indeg[to] += 1;
     }
 
-    // Tie-break key per component = smallest original index among members.
-    let min_orig: Vec<usize> = comps
-        .iter()
-        .map(|m| *m.iter().min().unwrap_or(&0))
-        .collect();
-
-    // Kahn's algorithm; among ready comps prefer the smallest original index.
-    let mut heap: BinaryHeap<Reverse<(usize, usize)>> = BinaryHeap::new();
-    for c in 0..ncomp {
-        if indeg[c] == 0 {
-            heap.push(Reverse((min_orig[c], c)));
+    let key = |c: usize| -> (Tie, String, usize) {
+        let min_g = comps[c].iter().map(|&l| members[l]).min().unwrap();
+        let min_name = comps[c].iter().map(|&l| names[members[l]].clone()).min().unwrap();
+        (opts.outside, min_name, min_g)
+    };
+    let cmp = |a: usize, b: usize| {
+        let (_, an, ag) = key(a);
+        let (_, bn, bg) = key(b);
+        match opts.outside {
+            Tie::Alphabetical => an.cmp(&bn).then(ag.cmp(&bg)),
+            Tie::Original => ag.cmp(&bg),
         }
-    }
-    let mut comp_order: Vec<usize> = Vec::with_capacity(ncomp);
-    while let Some(Reverse((_, c))) = heap.pop() {
+    };
+
+    // Kahn with an explicit min-selection so the tie-break is fully controlled.
+    let mut ready: Vec<usize> = (0..ncomp).filter(|&c| indeg[c] == 0).collect();
+    let mut comp_order = Vec::with_capacity(ncomp);
+    while !ready.is_empty() {
+        let pick = (0..ready.len()).min_by(|&i, &j| cmp(ready[i], ready[j])).unwrap();
+        let c = ready.swap_remove(pick);
         comp_order.push(c);
         for &to in &succ[c] {
             indeg[to] -= 1;
             if indeg[to] == 0 {
-                heap.push(Reverse((min_orig[to], to)));
+                ready.push(to);
             }
         }
     }
-    // Safety net: if a cycle in the condensation somehow remained, append the rest.
-    if comp_order.len() < ncomp {
-        for c in 0..ncomp {
-            if !comp_order.contains(&c) {
-                comp_order.push(c);
-            }
-        }
-    }
+    let seen: std::collections::HashSet<usize> = comp_order.iter().copied().collect();
+    comp_order.extend((0..ncomp).filter(|c| !seen.contains(c)));
 
-    // Flatten components into the final item order, ordering members within each.
     let mut order = Vec::with_capacity(n);
-    let mut in_mutual = vec![false; n];
-    let mut mutual_groups: Vec<Vec<usize>> = Vec::new();
+    let mut groups = Vec::new();
     for &c in &comp_order {
-        let mut members = comps[c].clone();
-        if members.len() > 1 {
-            if alphabetical {
-                members.sort_by(|&x, &y| names[x].cmp(&names[y]).then(x.cmp(&y)));
-            } else {
-                members.sort();
-            }
-            for &m in &members {
-                in_mutual[m] = true;
-            }
-            mutual_groups.push(members.clone());
+        let mut mem: Vec<usize> = comps[c].iter().map(|&l| members[l]).collect();
+        match opts.inside {
+            Tie::Alphabetical => mem.sort_by(|&x, &y| names[x].cmp(&names[y]).then(x.cmp(&y))),
+            Tie::Original => mem.sort_unstable(),
         }
-        order.extend(members);
+        if mem.len() > 1 {
+            groups.push(mem.clone());
+        }
+        order.extend(mem);
     }
-
-    Ordering {
-        order,
-        comp_of,
-        in_mutual,
-        mutual_groups,
-    }
+    (order, groups)
 }
 
-/// Tarjan's SCC. Returns (component-id per node, components as member lists).
-fn tarjan(n: usize, deps: &[Vec<usize>]) -> (Vec<usize>, Vec<Vec<usize>>) {
-    struct State<'a> {
-        deps: &'a [Vec<usize>],
-        index: usize,
-        idx: Vec<Option<usize>>,
+/// Tarjan's SCC over a local 0..n graph. Returns (comp-of-node, components).
+fn tarjan(n: usize, adj: &[Vec<usize>]) -> (Vec<usize>, Vec<Vec<usize>>) {
+    struct S<'a> {
+        adj: &'a [Vec<usize>],
+        idx: usize,
+        index: Vec<Option<usize>>,
         low: Vec<usize>,
         on: Vec<bool>,
         stack: Vec<usize>,
         comp_of: Vec<usize>,
         comps: Vec<Vec<usize>>,
     }
-    impl<'a> State<'a> {
-        fn connect(&mut self, v: usize) {
-            self.idx[v] = Some(self.index);
-            self.low[v] = self.index;
-            self.index += 1;
+    impl<'a> S<'a> {
+        fn go(&mut self, v: usize) {
+            self.index[v] = Some(self.idx);
+            self.low[v] = self.idx;
+            self.idx += 1;
             self.stack.push(v);
             self.on[v] = true;
-            for &w in &self.deps[v] {
-                match self.idx[w] {
+            for &w in &self.adj[v] {
+                match self.index[w] {
                     None => {
-                        self.connect(w);
+                        self.go(w);
                         self.low[v] = self.low[v].min(self.low[w]);
                     }
-                    Some(wi) => {
-                        if self.on[w] {
-                            self.low[v] = self.low[v].min(wi);
-                        }
-                    }
+                    Some(wi) if self.on[w] => self.low[v] = self.low[v].min(wi),
+                    _ => {}
                 }
             }
-            if self.low[v] == self.idx[v].unwrap() {
+            if self.low[v] == self.index[v].unwrap() {
                 let cid = self.comps.len();
                 let mut members = Vec::new();
                 loop {
@@ -147,21 +156,20 @@ fn tarjan(n: usize, deps: &[Vec<usize>]) -> (Vec<usize>, Vec<Vec<usize>>) {
             }
         }
     }
-
-    let mut st = State {
-        deps,
-        index: 0,
-        idx: vec![None; n],
+    let mut s = S {
+        adj,
+        idx: 0,
+        index: vec![None; n],
         low: vec![0; n],
         on: vec![false; n],
         stack: Vec::new(),
         comp_of: vec![0; n],
         comps: Vec::new(),
     };
-    for v in 0..n {
-        if st.idx[v].is_none() {
-            st.connect(v);
+    (0..n).for_each(|v| {
+        if s.index[v].is_none() {
+            s.go(v);
         }
-    }
-    (st.comp_of, st.comps)
+    });
+    (s.comp_of, s.comps)
 }

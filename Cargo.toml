@@ -1,8 +1,12 @@
 [package]
 name = "rsorder"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Topologically reorder Rust items (definition-before-use), Lean-style mutual blocks, with Mermaid dependency views."
+description = "Topologically reorder Rust items (definition-before-use), Lean-style mutual blocks, scoped // TO REORDER regions, with HTML/Mermaid dependency views."
+
+[lib]
+name = "rsorder"
+path = "src/lib.rs"
 
 [[bin]]
 name = "rsorder"
@@ -13,3 +17,4 @@ syn = { version = "2", features = ["full", "visit", "extra-traits"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
 quote = "1"
 glob = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "process"] }
