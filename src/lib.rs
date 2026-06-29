@@ -9,7 +9,7 @@ pub mod render;
 
 use std::collections::HashMap;
 
-use order::{OrderOpts, order_scope};
+use order::{InsideMutualTie, NonMutualTie, OrderOpts, order_scope};
 
 #[derive(Debug, Clone)]
 struct Segment {
@@ -94,8 +94,8 @@ pub fn check(src: &str) -> syn::Result<CheckReport> {
         &deps_g,
         &names,
         OrderOpts {
-            inside: order::Tie::Original,
-            outside: order::Tie::Original,
+            inside: InsideMutualTie::Original,
+            outside: NonMutualTie::Original,
         },
     );
     let mut group_of = HashMap::new();
@@ -248,14 +248,7 @@ pub fn reorder(src: &str, global: OrderOpts) -> syn::Result<Outcome> {
                     blank_before: items[r.first].blank_before,
                 });
                 let (order, _) = &region_orders[ri];
-                let mut emitted = emit_ordered(
-                    order,
-                    &group_of_g,
-                    items,
-                    true,
-                    &g2c,
-                    &mut after_g,
-                );
+                let mut emitted = emit_ordered(order, &group_of_g, items, true, &g2c, &mut after_g);
                 if let Some(first) = emitted.first_mut() {
                     first.blank_before = false;
                 }

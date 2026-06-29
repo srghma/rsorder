@@ -4,7 +4,16 @@
 use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Tie {
+pub enum InsideMutualTie {
+    /// Preserve original source order inside a mutual group.
+    #[default]
+    Original,
+    /// Sort members of a mutual group alphabetically by name.
+    Alphabetical,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NonMutualTie {
     /// Preserve original source order among items at the same level.
     #[default]
     Original,
@@ -17,9 +26,9 @@ pub enum Tie {
 #[derive(Debug, Clone, Copy)]
 pub struct OrderOpts {
     /// Tie-break for members within a mutual group.
-    pub inside: Tie,
+    pub inside: InsideMutualTie,
     /// Tie-break among independent items/components outside mutual groups.
-    pub outside: Tie,
+    pub outside: NonMutualTie,
 }
 
 /// Order `members` (global item indices) by their dependencies.
@@ -67,8 +76,8 @@ pub fn order_scope(
     }
 
     let comp_order = match opts.outside {
-        Tie::Topological => dependency_first_order(ncomp, &comps, &members, &edges),
-        Tie::Original | Tie::Alphabetical => {
+        NonMutualTie::Topological => dependency_first_order(ncomp, &comps, &members, &edges),
+        NonMutualTie::Original | NonMutualTie::Alphabetical => {
             let key = |c: usize| -> (String, usize) {
                 let min_g = comps[c].iter().map(|&l| members[l]).min().unwrap();
                 let min_name = comps[c]
@@ -82,8 +91,8 @@ pub fn order_scope(
                 let (an, ag) = key(a);
                 let (bn, bg) = key(b);
                 match opts.outside {
-                    Tie::Alphabetical => an.cmp(&bn).then(ag.cmp(&bg)),
-                    Tie::Original | Tie::Topological => ag.cmp(&bg),
+                    NonMutualTie::Alphabetical => an.cmp(&bn).then(ag.cmp(&bg)),
+                    NonMutualTie::Original | NonMutualTie::Topological => ag.cmp(&bg),
                 }
             };
 
@@ -114,8 +123,10 @@ pub fn order_scope(
     for &c in &comp_order {
         let mut mem: Vec<usize> = comps[c].iter().map(|&l| members[l]).collect();
         match opts.inside {
-            Tie::Alphabetical => mem.sort_by(|&x, &y| names[x].cmp(&names[y]).then(x.cmp(&y))),
-            Tie::Original | Tie::Topological => mem.sort_unstable(),
+            InsideMutualTie::Alphabetical => {
+                mem.sort_by(|&x, &y| names[x].cmp(&names[y]).then(x.cmp(&y)))
+            }
+            InsideMutualTie::Original => mem.sort_unstable(),
         }
         if mem.len() > 1 {
             groups.push(mem.clone());

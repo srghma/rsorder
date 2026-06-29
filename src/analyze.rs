@@ -9,13 +9,13 @@ use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 
 use crate::model::{Item, classify};
-use crate::order::Tie;
+use crate::order::{InsideMutualTie, NonMutualTie};
 
 /// Per-region option overrides. `None` means "inherit the global setting".
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RegionOpts {
-    pub inside: Option<Tie>,
-    pub outside: Option<Tie>,
+    pub inside: Option<InsideMutualTie>,
+    pub outside: Option<NonMutualTie>,
 }
 
 #[derive(Debug, Clone)]
@@ -51,7 +51,11 @@ pub fn parse(src: &str) -> syn::Result<FileModel> {
         .iter()
         .map(|it| {
             let r = it.span().byte_range();
-            (it.clone(), r.start, r.end)
+            (
+                it.clone(),
+                r.start,
+                extend_end_to_inline_comment(src, r.end),
+            )
         })
         .collect();
     raws.sort_by_key(|r| r.1);
@@ -184,20 +188,30 @@ fn scan_markers(src: &str) -> Vec<Marker> {
     out
 }
 
+fn extend_end_to_inline_comment(src: &str, end: usize) -> usize {
+    let rest = &src[end..];
+    let line_end = rest.find('\n').unwrap_or(rest.len());
+    let tail = &rest[..line_end];
+    match tail.find("//") {
+        Some(pos) if tail[..pos].trim().is_empty() => end + line_end,
+        _ => end,
+    }
+}
+
 fn parse_opts(rest: &str) -> RegionOpts {
     rest.split_whitespace()
         .fold(RegionOpts::default(), |mut o, tok| {
             if let Some(value) = tok.strip_prefix("sorting-inside-mutual=") {
                 match value {
-                    "alphabetical" => o.inside = Some(Tie::Alphabetical),
-                    "original" => o.inside = Some(Tie::Original),
+                    "alphabetical" => o.inside = Some(InsideMutualTie::Alphabetical),
+                    "original" => o.inside = Some(InsideMutualTie::Original),
                     _ => {}
                 }
             } else if let Some(value) = tok.strip_prefix("sorting-non-mutual=") {
                 match value {
-                    "alphabetical" => o.outside = Some(Tie::Alphabetical),
-                    "topological" => o.outside = Some(Tie::Topological),
-                    "original" => o.outside = Some(Tie::Original),
+                    "alphabetical" => o.outside = Some(NonMutualTie::Alphabetical),
+                    "topological" => o.outside = Some(NonMutualTie::Topological),
+                    "original" => o.outside = Some(NonMutualTie::Original),
                     _ => {}
                 }
             }

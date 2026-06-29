@@ -5,15 +5,16 @@ use std::collections::BTreeSet;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
-use rsorder::order::{OrderOpts, Tie};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use rsorder::order::{InsideMutualTie, NonMutualTie, OrderOpts};
 use rsorder::{Outcome, check, render, reorder};
 
 #[derive(Clone)]
 struct Cli {
     mode: Mode,
     patterns: Vec<String>,
-    inside: Tie,
-    outside: Tie,
+    inside: InsideMutualTie,
+    outside: NonMutualTie,
     mermaid_before: bool,
     mermaid_after: bool,
     html_diff: bool,
@@ -28,130 +29,112 @@ enum Mode {
     Check,
 }
 
-const USAGE: &str = "\
-rsorder - reorder Rust items definition-before-use, wrap mutual cycles
-
-USAGE:
-    rsorder reorder [OPTIONS] <GLOB>...
-    rsorder check [OPTIONS] <GLOB>...
-
-ORDERING:
-        --sorting-non-mutual=original|alphabetical|topological
-        --sorting-inside-mutual=original|alphabetical
-            Set the global ordering policy; a `// TO REORDER <opts>` region
-            header overrides it. The default is original order for ties.
-
-MODES:
-    reorder rewrites/dry-runs reordered source.
-    check reports and exits nonzero when an item uses a later non-mutual item.
-
-SCOPED MODE:
-    If a file contains at least one `// TO REORDER` ... `// TO REORDER END`
-    region, ONLY the declarations inside those regions are reordered.
-
-OUTPUTS (written under a per-run temp dir, opened with xdg-open):
-        --mermaid-write-before     write <file>-before.mermaid (+ svg via mmdr)
-        --mermaid-write-after      write <file>-after.mermaid  (+ svg via mmdr)
-        --write-html-before-after-diff-table
-                                   write <file>-before-after.html and open it
-    -w, --write                    rewrite the .rs files in place
-        --stdout                   also print reordered contents to stdout
-        --no-color                 disable ANSI colors
-    -h, --help                     show this help";
-
 fn parse_cli() -> Cli {
-    let mut args = std::env::args().skip(1).peekable();
-    let mode = match args.peek().map(String::as_str) {
-        Some("-h" | "--help") => {
-            println!("{USAGE}");
-            std::process::exit(0);
-        }
-        Some("reorder") => {
-            let _ = args.next();
-            Mode::Reorder
-        }
-        Some("check") => {
-            let _ = args.next();
-            Mode::Check
-        }
-        Some(other) => {
-            eprintln!("error: expected command `reorder` or `check`, got `{other}`\n\n{USAGE}");
-            std::process::exit(2);
-        }
-        None => {
-            eprintln!("error: command `reorder` or `check` is required\n\n{USAGE}");
-            std::process::exit(2);
-        }
+    let args = RawCli::parse();
+    let (mode, opts) = match args.command {
+        Command::Reorder(opts) => (Mode::Reorder, opts),
+        Command::Check(opts) => (Mode::Check, opts),
     };
-    let mut c = Cli {
+    Cli {
         mode,
-        patterns: vec![],
-        inside: Tie::Original,
-        outside: Tie::Original,
-        mermaid_before: false,
-        mermaid_after: false,
-        html_diff: false,
-        write: false,
-        stdout: false,
-        color: std::io::stdout().is_terminal(),
-    };
-    for a in args {
-        match a.as_str() {
-            "-h" | "--help" => {
-                println!("{USAGE}");
-                std::process::exit(0);
-            }
-            s if s.starts_with("--sorting-non-mutual=") => {
-                let value = s.trim_start_matches("--sorting-non-mutual=");
-                c.outside = parse_non_mutual_sorting(value);
-            }
-            s if s.starts_with("--sorting-inside-mutual=") => {
-                let value = s.trim_start_matches("--sorting-inside-mutual=");
-                c.inside = parse_inside_mutual_sorting(value);
-            }
-            "--mermaid-write-before" => c.mermaid_before = true,
-            "--mermaid-write-after" => c.mermaid_after = true,
-            "--write-html-before-after-diff-table" => c.html_diff = true,
-            "-w" | "--write" => c.write = true,
-            "--stdout" => c.stdout = true,
-            "--no-color" => c.color = false,
-            s if s.starts_with('-') => {
-                eprintln!("unknown option: {s}\n\n{USAGE}");
-                std::process::exit(2);
-            }
-            s => c.patterns.push(s.to_string()),
-        }
-    }
-    if c.patterns.is_empty() {
-        eprintln!("error: at least one glob pattern is required\n\n{USAGE}");
-        std::process::exit(2);
-    }
-    c
-}
-
-fn parse_non_mutual_sorting(value: &str) -> Tie {
-    match value {
-        "original" => Tie::Original,
-        "alphabetical" => Tie::Alphabetical,
-        "topological" => Tie::Topological,
-        _ => {
-            eprintln!(
-                "error: invalid --sorting-non-mutual value `{value}`; expected original, alphabetical, or topological\n\n{USAGE}"
-            );
-            std::process::exit(2);
-        }
+        patterns: opts.patterns,
+        inside: opts.sorting_inside_mutual.into(),
+        outside: opts.sorting_non_mutual.into(),
+        mermaid_before: opts.mermaid_before,
+        mermaid_after: opts.mermaid_after,
+        html_diff: opts.html_diff,
+        write: opts.write,
+        stdout: opts.stdout,
+        color: !opts.no_color && std::io::stdout().is_terminal(),
     }
 }
 
-fn parse_inside_mutual_sorting(value: &str) -> Tie {
-    match value {
-        "original" => Tie::Original,
-        "alphabetical" => Tie::Alphabetical,
-        _ => {
-            eprintln!(
-                "error: invalid --sorting-inside-mutual value `{value}`; expected original or alphabetical\n\n{USAGE}"
-            );
-            std::process::exit(2);
+#[derive(Parser)]
+#[command(about = "Reorder Rust items definition-before-use, wrapping mutual cycles")]
+struct RawCli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Rewrites or dry-runs reordered source.
+    Reorder(CommandOpts),
+    /// Reports and exits nonzero when an item uses a later non-mutual item.
+    Check(CommandOpts),
+}
+
+#[derive(Args)]
+struct CommandOpts {
+    /// Sort independent items/components outside mutual blocks.
+    #[arg(long, value_enum, default_value_t = NonMutualSorting::Original)]
+    sorting_non_mutual: NonMutualSorting,
+    /// Sort members inside a mutual block.
+    #[arg(long, value_enum, default_value_t = InsideMutualSorting::Original)]
+    sorting_inside_mutual: InsideMutualSorting,
+    /// Write <file>-before.mermaid under a per-run temp dir.
+    #[arg(long = "mermaid-write-before")]
+    mermaid_before: bool,
+    /// Write <file>-after.mermaid under a per-run temp dir.
+    #[arg(long = "mermaid-write-after")]
+    mermaid_after: bool,
+    /// Write <file>-before-after.html under a per-run temp dir.
+    #[arg(long = "write-html-before-after-diff-table")]
+    html_diff: bool,
+    /// Rewrite the .rs files in place.
+    #[arg(short, long)]
+    write: bool,
+    /// Also print reordered contents to stdout.
+    #[arg(long)]
+    stdout: bool,
+    /// Disable ANSI colors.
+    #[arg(long)]
+    no_color: bool,
+    /// Glob pattern(s) for .rs files.
+    #[arg(required = true, num_args = 1..)]
+    patterns: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum NonMutualSorting {
+    Original,
+    Alphabetical,
+    Topological,
+}
+
+impl std::fmt::Display for NonMutualSorting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.to_possible_value().unwrap().get_name().fmt(f)
+    }
+}
+
+impl From<NonMutualSorting> for NonMutualTie {
+    fn from(value: NonMutualSorting) -> Self {
+        match value {
+            NonMutualSorting::Original => NonMutualTie::Original,
+            NonMutualSorting::Alphabetical => NonMutualTie::Alphabetical,
+            NonMutualSorting::Topological => NonMutualTie::Topological,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum InsideMutualSorting {
+    Original,
+    Alphabetical,
+}
+
+impl std::fmt::Display for InsideMutualSorting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.to_possible_value().unwrap().get_name().fmt(f)
+    }
+}
+
+impl From<InsideMutualSorting> for InsideMutualTie {
+    fn from(value: InsideMutualSorting) -> Self {
+        match value {
+            InsideMutualSorting::Original => InsideMutualTie::Original,
+            InsideMutualSorting::Alphabetical => InsideMutualTie::Alphabetical,
         }
     }
 }

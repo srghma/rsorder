@@ -2,27 +2,13 @@
 //! standalone HTML before/after movement diagram.
 
 use crate::Plan;
+use serde::Serialize;
 
 fn esc_label(s: &str) -> String {
     s.replace('"', "'").replace('\n', " ")
 }
 fn esc_xml(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-fn esc_json(s: &str) -> String {
-    s.chars()
-        .flat_map(|c| match c {
-            '"' => "\\\"".chars().collect::<Vec<_>>(),
-            '\\' => "\\\\".chars().collect::<Vec<_>>(),
-            '\n' => "\\n".chars().collect::<Vec<_>>(),
-            '\r' => "\\r".chars().collect::<Vec<_>>(),
-            '\t' => "\\t".chars().collect::<Vec<_>>(),
-            c => vec![c],
-        })
-        .collect()
+    html_escape::encode_double_quoted_attribute(s).into_owned()
 }
 
 /// Mermaid dependency graph with nodes declared in original source order.
@@ -82,15 +68,12 @@ pub fn dependency_tree_json(plan: &Plan) -> String {
         }
     }
 
-    let mut out = String::from("[\n");
-    for (i, comp) in root_comps.iter().enumerate() {
-        out.push_str(&component_json(*comp, &members, &comp_deps, plan, 1));
-        if i + 1 != root_comps.len() {
-            out.push(',');
-        }
-        out.push('\n');
-    }
-    out.push_str("]\n");
+    let forest = root_comps
+        .into_iter()
+        .map(|comp| component_json(comp, &members, &comp_deps, plan))
+        .collect::<Vec<_>>();
+    let mut out = serde_json::to_string_pretty(&forest).expect("dependency tree is JSON");
+    out.push('\n');
     out
 }
 
@@ -99,10 +82,7 @@ fn component_json(
     members: &[Vec<usize>],
     comp_deps: &[Vec<usize>],
     plan: &Plan,
-    indent: usize,
-) -> String {
-    let pad = "  ".repeat(indent);
-    let child_pad = "  ".repeat(indent + 1);
+) -> DepNode {
     let ids = members[comp]
         .iter()
         .map(|&c| {
@@ -112,45 +92,26 @@ fn component_json(
                 .unwrap_or_else(|| plan.nodes[c].display.clone())
         })
         .collect::<Vec<_>>();
+    let deps = comp_deps[comp]
+        .iter()
+        .map(|&dep_comp| component_json(dep_comp, members, comp_deps, plan))
+        .collect::<Vec<_>>();
 
-    let mut out = String::new();
     if ids.len() > 1 {
-        out.push_str(&format!("{pad}{{ \"mutual\": ["));
-        for (i, id) in ids.iter().enumerate() {
-            if i > 0 {
-                out.push_str(", ");
-            }
-            out.push_str(&format!("\"{}\"", esc_json(id)));
-        }
-        out.push_str("], \"deps\": [");
+        DepNode::Mutual { mutual: ids, deps }
     } else {
-        out.push_str(&format!(
-            "{pad}{{ \"decl\": \"{}\", \"deps\": [",
-            esc_json(&ids[0])
-        ));
-    }
-
-    if comp_deps[comp].is_empty() {
-        out.push_str("] }");
-        return out;
-    }
-
-    out.push('\n');
-    for (i, dep_comp) in comp_deps[comp].iter().enumerate() {
-        out.push_str(&component_json(
-            *dep_comp,
-            members,
-            comp_deps,
-            plan,
-            indent + 1,
-        ));
-        if i + 1 != comp_deps[comp].len() {
-            out.push(',');
+        DepNode::Decl {
+            decl: ids[0].clone(),
+            deps,
         }
-        out.push('\n');
     }
-    out.push_str(&format!("{child_pad}] }}"));
-    out
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum DepNode {
+    Decl { decl: String, deps: Vec<DepNode> },
+    Mutual { mutual: Vec<String>, deps: Vec<DepNode> },
 }
 
 /// Mermaid dependency graph in reordered layout; mutual groups become subgraphs.

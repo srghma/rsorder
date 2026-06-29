@@ -9,7 +9,7 @@ use core::ffi::{c_char, c_int, c_void};
 use core::ptr;
 use core::sync::atomic::{AtomicI32, AtomicPtr, Ordering};
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
-use std::cell::Cell;
+use std::cell::Cell; // LONG COMMENT LONG COMMENT LONG COMMENT LONG COMMENT LONG COMMENT LONG COMMENT
 
 // This module is the Rust equivalent of upstream `lean.h` for ABI layouts and
 // helpers hardcoded by EmitRust. Do not import runtime modules here; runtime

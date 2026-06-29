@@ -1,15 +1,54 @@
 [
-  { "decl": "SCALE", "deps": [] },
-  { "decl": "Helper", "deps": [] },
-  { "decl": "impl Helper", "deps": [
-    { "decl": "SCALE", "deps": [] },
-    { "decl": "Helper", "deps": [] }
-    ] },
-  { "decl": "Config", "deps": [] },
-  { "mutual": ["ping", "pong"], "deps": [] },
-  { "decl": "run", "deps": [
-    { "decl": "Helper", "deps": [] },
-    { "decl": "Config", "deps": [] },
-    { "mutual": ["ping", "pong"], "deps": [] }
-    ] }
+  {
+    "decl": "SCALE",
+    "deps": []
+  },
+  {
+    "decl": "Helper",
+    "deps": []
+  },
+  {
+    "decl": "impl Helper",
+    "deps": [
+      {
+        "decl": "SCALE",
+        "deps": []
+      },
+      {
+        "decl": "Helper",
+        "deps": []
+      }
+    ]
+  },
+  {
+    "decl": "Config",
+    "deps": []
+  },
+  {
+    "mutual": [
+      "ping",
+      "pong"
+    ],
+    "deps": []
+  },
+  {
+    "decl": "run",
+    "deps": [
+      {
+        "decl": "Helper",
+        "deps": []
+      },
+      {
+        "decl": "Config",
+        "deps": []
+      },
+      {
+        "mutual": [
+          "ping",
+          "pong"
+        ],
+        "deps": []
+      }
+    ]
+  }
 ]

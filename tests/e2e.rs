@@ -7,10 +7,12 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 
-use rsorder::order::{OrderOpts, Tie};
+use assert_cmd::Command;
+use predicates::prelude::*;
+use rsorder::order::{InsideMutualTie, NonMutualTie, OrderOpts};
 use rsorder::{check, render, reorder};
+use similar::TextDiff;
 
 struct Case {
     name: &'static str,
@@ -20,16 +22,16 @@ struct Case {
 
 fn cases() -> Vec<Case> {
     let orig = OrderOpts {
-        inside: Tie::Original,
-        outside: Tie::Original,
+        inside: InsideMutualTie::Original,
+        outside: NonMutualTie::Original,
     };
     let alpha = OrderOpts {
-        inside: Tie::Alphabetical,
-        outside: Tie::Alphabetical,
+        inside: InsideMutualTie::Alphabetical,
+        outside: NonMutualTie::Alphabetical,
     };
     let topo = OrderOpts {
-        inside: Tie::Original,
-        outside: Tie::Topological,
+        inside: InsideMutualTie::Original,
+        outside: NonMutualTie::Topological,
     };
     vec![
         Case {
@@ -92,7 +94,10 @@ fn golden() {
             Ok(expected) if !bless => {
                 if out != expected {
                     failures.push(format!("{}.rs", case.name));
-                    eprintln!("--- mismatch for `{}` ---\n{out}", case.name);
+                    eprintln!(
+                        "{}",
+                        unified_diff(&expected, &out, &format!("tests/golden/{}.rs", case.name))
+                    );
                 }
             }
             // Missing snapshot or BLESS: write it and pass.
@@ -105,8 +110,12 @@ fn golden() {
                 if graph != expected {
                     failures.push(format!("{}.deps.json", case.name));
                     eprintln!(
-                        "--- dependency JSON mismatch for `{}` ---\n{graph}",
-                        case.name
+                        "{}",
+                        unified_diff(
+                            &expected,
+                            &graph,
+                            &format!("tests/golden/{}.deps.json", case.name)
+                        )
                     );
                 }
             }
@@ -120,6 +129,13 @@ fn golden() {
     );
 }
 
+fn unified_diff(expected: &str, actual: &str, label: &str) -> String {
+    TextDiff::from_lines(expected, actual)
+        .unified_diff()
+        .header(&format!("{label} expected"), &format!("{label} actual"))
+        .to_string()
+}
+
 /// Outside items stay fixed and regions are detected in scoped mode.
 #[test]
 fn scoped_keeps_outside_fixed() {
@@ -127,8 +143,8 @@ fn scoped_keeps_outside_fixed() {
     let out = reorder(
         &src,
         OrderOpts {
-            inside: Tie::Original,
-            outside: Tie::Original,
+            inside: InsideMutualTie::Original,
+            outside: NonMutualTie::Original,
         },
     )
     .unwrap();
@@ -147,8 +163,8 @@ fn mutual_detection() {
     let out = reorder(
         src,
         OrderOpts {
-            inside: Tie::Original,
-            outside: Tie::Original,
+            inside: InsideMutualTie::Original,
+            outside: NonMutualTie::Original,
         },
     )
     .unwrap();
@@ -177,8 +193,8 @@ fn outside_topological_emits_dependency_chain_before_unrelated_items() {
     let out = reorder(
         src,
         OrderOpts {
-            inside: Tie::Original,
-            outside: Tie::Topological,
+            inside: InsideMutualTie::Original,
+            outside: NonMutualTie::Topological,
         },
     )
     .unwrap()
@@ -195,8 +211,8 @@ fn preserves_adjacent_declaration_spacing() {
     let out = reorder(
         src,
         OrderOpts {
-            inside: Tie::Original,
-            outside: Tie::Original,
+            inside: InsideMutualTie::Original,
+            outside: NonMutualTie::Original,
         },
     )
     .unwrap()
@@ -204,16 +220,37 @@ fn preserves_adjacent_declaration_spacing() {
     assert!(out.contains("type A = u8;\ntype B = A;"), "{out}");
     assert!(out.contains("const C: u8 = 1;\nconst D: u8 = C;"), "{out}");
     assert!(!out.contains("type A = u8;\n\ntype B = A;"), "{out}");
-    assert!(!out.contains("const C: u8 = 1;\n\nconst D: u8 = C;"), "{out}");
+    assert!(
+        !out.contains("const C: u8 = 1;\n\nconst D: u8 = C;"),
+        "{out}"
+    );
+}
+
+#[test]
+fn preserves_trailing_item_comments() {
+    let src = "use std::cell::Cell; // keep me\n\ntype Size = usize;\n";
+    let out = reorder(
+        src,
+        OrderOpts {
+            inside: InsideMutualTie::Original,
+            outside: NonMutualTie::Original,
+        },
+    )
+    .unwrap()
+    .new_src;
+    assert!(out.contains("use std::cell::Cell; // keep me"), "{out}");
+    assert!(!out.contains("\n// keep me\n"), "{out}");
 }
 
 #[test]
 fn cli_requires_command_and_check_reports_violations() {
-    let bin = env!("CARGO_BIN_EXE_rsorder");
     let input = input_dir().join("whole_basic.rs");
-    let bare = Command::new(bin).arg(&input).output().unwrap();
-    assert!(!bare.status.success());
-    assert!(String::from_utf8_lossy(&bare.stderr).contains("expected command"));
+    Command::cargo_bin("rsorder")
+        .unwrap()
+        .arg(&input)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unrecognized subcommand"));
 
     let path = std::env::temp_dir().join(format!(
         "rsorder-check-{}-{}.rs",
@@ -221,16 +258,16 @@ fn cli_requires_command_and_check_reports_violations() {
         "violation"
     ));
     fs::write(&path, "fn user(){dep();}\nfn dep(){}\n").unwrap();
-    let check = Command::new(bin)
+    Command::cargo_bin("rsorder")
+        .unwrap()
         .args(["check", "--no-color"])
         .arg(&path)
-        .output()
-        .unwrap();
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains(
+            "user uses later dep (line 1 before line 2",
+        ))
+        .stdout(predicate::str::contains("items moved").not())
+        .stdout(predicate::str::contains("dry run").not());
     let _ = fs::remove_file(&path);
-
-    assert!(!check.status.success());
-    let stdout = String::from_utf8_lossy(&check.stdout);
-    assert!(stdout.contains("user uses later dep (line 1 before line 2"), "{stdout}");
-    assert!(!stdout.contains("items moved"), "{stdout}");
-    assert!(!stdout.contains("dry run"), "{stdout}");
 }

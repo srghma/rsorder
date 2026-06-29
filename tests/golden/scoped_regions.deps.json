@@ -1,20 +1,65 @@
 [
-  { "decl": "keep_first", "deps": [
-    { "decl": "keep_second", "deps": [] }
-    ] },
-  { "decl": "keep_second", "deps": [] },
-  { "decl": "BETA", "deps": [] },
-  { "decl": "alpha", "deps": [] },
-  { "decl": "zeta", "deps": [
-    { "decl": "alpha", "deps": [] }
-    ] },
-  { "mutual": ["even", "odd"], "deps": [] },
-  { "decl": "user", "deps": [
-    { "mutual": ["even", "odd"], "deps": [] }
-    ] },
-  { "decl": "keep_last", "deps": [
-    { "decl": "keep_first", "deps": [
-      { "decl": "keep_second", "deps": [] }
-      ] }
-    ] }
+  {
+    "decl": "keep_first",
+    "deps": [
+      {
+        "decl": "keep_second",
+        "deps": []
+      }
+    ]
+  },
+  {
+    "decl": "keep_second",
+    "deps": []
+  },
+  {
+    "decl": "BETA",
+    "deps": []
+  },
+  {
+    "decl": "alpha",
+    "deps": []
+  },
+  {
+    "decl": "zeta",
+    "deps": [
+      {
+        "decl": "alpha",
+        "deps": []
+      }
+    ]
+  },
+  {
+    "mutual": [
+      "even",
+      "odd"
+    ],
+    "deps": []
+  },
+  {
+    "decl": "user",
+    "deps": [
+      {
+        "mutual": [
+          "even",
+          "odd"
+        ],
+        "deps": []
+      }
+    ]
+  },
+  {
+    "decl": "keep_last",
+    "deps": [
+      {
+        "decl": "keep_first",
+        "deps": [
+          {
+            "decl": "keep_second",
+            "deps": []
+          }
+        ]
+      }
+    ]
+  }
 ]
