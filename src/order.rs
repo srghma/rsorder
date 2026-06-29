@@ -10,6 +10,8 @@ pub enum Tie {
     Original,
     /// Sort alphabetically by name among items at the same level.
     Alphabetical,
+    /// Walk source items and emit each component's dependencies first.
+    Topological,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -64,36 +66,42 @@ pub fn order_scope(
         indeg[to] += 1;
     }
 
-    let key = |c: usize| -> (Tie, String, usize) {
-        let min_g = comps[c].iter().map(|&l| members[l]).min().unwrap();
-        let min_name = comps[c].iter().map(|&l| names[members[l]].clone()).min().unwrap();
-        (opts.outside, min_name, min_g)
-    };
-    let cmp = |a: usize, b: usize| {
-        let (_, an, ag) = key(a);
-        let (_, bn, bg) = key(b);
-        match opts.outside {
-            Tie::Alphabetical => an.cmp(&bn).then(ag.cmp(&bg)),
-            Tie::Original => ag.cmp(&bg),
-        }
-    };
+    let comp_order = match opts.outside {
+        Tie::Topological => dependency_first_order(ncomp, &comps, &members, &edges),
+        Tie::Original | Tie::Alphabetical => {
+            let key = |c: usize| -> (String, usize) {
+                let min_g = comps[c].iter().map(|&l| members[l]).min().unwrap();
+                let min_name = comps[c].iter().map(|&l| names[members[l]].clone()).min().unwrap();
+                (min_name, min_g)
+            };
+            let cmp = |a: usize, b: usize| {
+                let (an, ag) = key(a);
+                let (bn, bg) = key(b);
+                match opts.outside {
+                    Tie::Alphabetical => an.cmp(&bn).then(ag.cmp(&bg)),
+                    Tie::Original | Tie::Topological => ag.cmp(&bg),
+                }
+            };
 
-    // Kahn with an explicit min-selection so the tie-break is fully controlled.
-    let mut ready: Vec<usize> = (0..ncomp).filter(|&c| indeg[c] == 0).collect();
-    let mut comp_order = Vec::with_capacity(ncomp);
-    while !ready.is_empty() {
-        let pick = (0..ready.len()).min_by(|&i, &j| cmp(ready[i], ready[j])).unwrap();
-        let c = ready.swap_remove(pick);
-        comp_order.push(c);
-        for &to in &succ[c] {
-            indeg[to] -= 1;
-            if indeg[to] == 0 {
-                ready.push(to);
+            // Kahn with an explicit min-selection so the tie-break is fully controlled.
+            let mut ready: Vec<usize> = (0..ncomp).filter(|&c| indeg[c] == 0).collect();
+            let mut comp_order = Vec::with_capacity(ncomp);
+            while !ready.is_empty() {
+                let pick = (0..ready.len()).min_by(|&i, &j| cmp(ready[i], ready[j])).unwrap();
+                let c = ready.swap_remove(pick);
+                comp_order.push(c);
+                for &to in &succ[c] {
+                    indeg[to] -= 1;
+                    if indeg[to] == 0 {
+                        ready.push(to);
+                    }
+                }
             }
+            let seen: std::collections::HashSet<usize> = comp_order.iter().copied().collect();
+            comp_order.extend((0..ncomp).filter(|c| !seen.contains(c)));
+            comp_order
         }
-    }
-    let seen: std::collections::HashSet<usize> = comp_order.iter().copied().collect();
-    comp_order.extend((0..ncomp).filter(|c| !seen.contains(c)));
+    };
 
     let mut order = Vec::with_capacity(n);
     let mut groups = Vec::new();
@@ -101,7 +109,7 @@ pub fn order_scope(
         let mut mem: Vec<usize> = comps[c].iter().map(|&l| members[l]).collect();
         match opts.inside {
             Tie::Alphabetical => mem.sort_by(|&x, &y| names[x].cmp(&names[y]).then(x.cmp(&y))),
-            Tie::Original => mem.sort_unstable(),
+            Tie::Original | Tie::Topological => mem.sort_unstable(),
         }
         if mem.len() > 1 {
             groups.push(mem.clone());
@@ -109,6 +117,41 @@ pub fn order_scope(
         order.extend(mem);
     }
     (order, groups)
+}
+
+fn dependency_first_order(
+    ncomp: usize,
+    comps: &[Vec<usize>],
+    members: &[usize],
+    edges: &BTreeSet<(usize, usize)>,
+) -> Vec<usize> {
+    let mut deps = vec![Vec::new(); ncomp];
+    for &(dep, user) in edges {
+        deps[user].push(dep);
+    }
+    for ds in &mut deps {
+        ds.sort_by_key(|&c| comps[c].iter().map(|&l| members[l]).min().unwrap());
+    }
+
+    let mut starts: Vec<usize> = (0..ncomp).collect();
+    starts.sort_by_key(|&c| comps[c].iter().map(|&l| members[l]).min().unwrap());
+
+    let mut seen = vec![false; ncomp];
+    let mut order = Vec::with_capacity(ncomp);
+    fn visit(c: usize, deps: &[Vec<usize>], seen: &mut [bool], order: &mut Vec<usize>) {
+        if seen[c] {
+            return;
+        }
+        seen[c] = true;
+        for &d in &deps[c] {
+            visit(d, deps, seen, order);
+        }
+        order.push(c);
+    }
+    for c in starts {
+        visit(c, &deps, &mut seen, &mut order);
+    }
+    order
 }
 
 /// Tarjan's SCC over a local 0..n graph. Returns (comp-of-node, components).

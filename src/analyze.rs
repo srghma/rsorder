@@ -167,6 +167,7 @@ fn parse_opts(rest: &str) -> RegionOpts {
             "same-level-inside-of-mutual--original" => o.inside = Some(Tie::Original),
             "same-level-outside-of-mutual--alphabetically" => o.outside = Some(Tie::Alphabetical),
             "same-level-outside-of-mutual--original" => o.outside = Some(Tie::Original),
+            "same-level-outside-of-mutual--topological" => o.outside = Some(Tie::Topological),
             _ => {}
         }
         o

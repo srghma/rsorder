@@ -9,7 +9,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use rsorder::order::{OrderOpts, Tie};
-use rsorder::reorder;
+use rsorder::{check, reorder};
 
 const WHOLE_BASIC: &str = r#"use std::collections::HashMap;
 
@@ -122,4 +122,31 @@ fn mutual_detection() {
     assert_eq!(out.plan.mutual_groups.len(), 1);
     assert_eq!(out.plan.mutual_groups[0].len(), 2);
     assert!(out.new_src.contains("// mutual start"));
+}
+
+#[test]
+fn check_fails_on_later_non_mutual_dependency() {
+    let bad = "fn user(){dep();}\nfn dep(){}";
+    let report = check(bad).unwrap();
+    assert_eq!(report.violations.len(), 1);
+    assert_eq!(report.violations[0].user, "user");
+    assert_eq!(report.violations[0].dependency, "dep");
+
+    let mutual = "fn a(){b();}\nfn b(){a();}";
+    assert!(check(mutual).unwrap().is_ok());
+}
+
+#[test]
+fn outside_topological_emits_dependency_chain_before_unrelated_items() {
+    let src = "fn user(){dep();}\nfn unrelated(){}\nfn dep(){}";
+    let out = reorder(
+        src,
+        OrderOpts { inside: Tie::Original, outside: Tie::Topological },
+    )
+    .unwrap()
+    .new_src;
+    let dep = out.find("fn dep").unwrap();
+    let user = out.find("fn user").unwrap();
+    let unrelated = out.find("fn unrelated").unwrap();
+    assert!(dep < user && user < unrelated, "{out}");
 }

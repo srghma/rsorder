@@ -18,8 +18,14 @@ cargo test                 # unit + golden e2e tests
 ## Usage
 
 ```
+rsorder reorder [OPTIONS] <GLOB>...
+rsorder check [OPTIONS] <GLOB>...
 rsorder [OPTIONS] <GLOB>...
 ```
+
+`reorder` is the default mode, so existing bare `rsorder ...` invocations still
+dry-run or rewrite reordered source. `check` only validates the current order
+and exits nonzero when an item uses a later non-mutual item.
 
 ### Ordering policy
 
@@ -29,6 +35,8 @@ Two independent tie-break controls (each defaults to **original order**):
   mutual block alphabetically.
 * `--same-level-outside-of-mutual--alphabetically` — sort independent
   items/components *outside* mutual blocks alphabetically.
+* `--same-level-outside-of-mutual--topological` — walk source items and emit
+  each dependency chain before unrelated items outside mutual blocks.
 
 ### Scoped mode — `// TO REORDER` regions
 
@@ -85,15 +93,18 @@ the paths of any files it wrote.
 
 ```sh
 # Dry run, alphabetical everywhere, see the result
-rsorder src/lib.rs --stdout \
+rsorder reorder src/lib.rs --stdout \
   --same-level-outside-of-mutual--alphabetically \
   --same-level-inside-of-mutual--alphabetically
 
 # Apply across a tree
-rsorder 'src/**/*.rs' --write
+rsorder reorder 'src/**/*.rs' --write
+
+# Fail if any item uses a later non-mutual item
+rsorder check 'src/**/*.rs'
 
 # Visualize movement + dependency graphs
-rsorder src/lib.rs --write-html-before-after-diff-table \
+rsorder reorder src/lib.rs --write-html-before-after-diff-table \
   --mermaid-write-before --mermaid-write-after
 ```
 
@@ -106,7 +117,8 @@ rsorder src/lib.rs --write-html-before-after-diff-table \
 * `macro_rules!` definitions are dependencies of their call sites, so a macro is
   ordered before its invocations (which Rust requires).
 * Independent items keep original relative order unless the relevant
-  `--...--alphabetically` flag (or region override) is set.
+  `--...--alphabetically` or `--...--topological` flag (or region override) is
+  set.
 
 ## Preservation guarantees
 

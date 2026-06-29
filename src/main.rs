@@ -6,12 +6,14 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use rsorder::order::{OrderOpts, Tie};
-use rsorder::{render, reorder, Outcome};
+use rsorder::{check, render, reorder, Outcome};
 
 #[derive(Clone)]
 struct Cli {
+    mode: Mode,
     patterns: Vec<String>,
     inside_alpha: bool,
+    outside_topological: bool,
     outside_alpha: bool,
     mermaid_before: bool,
     mermaid_after: bool,
@@ -21,17 +23,30 @@ struct Cli {
     color: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Reorder,
+    Check,
+}
+
 const USAGE: &str = "\
 rsorder - reorder Rust items definition-before-use, wrap mutual cycles
 
 USAGE:
+    rsorder reorder [OPTIONS] <GLOB>...
+    rsorder check [OPTIONS] <GLOB>...
     rsorder [OPTIONS] <GLOB>...
 
 ORDERING:
         --same-level-inside-of-mutual--alphabetically
         --same-level-outside-of-mutual--alphabetically
-            Sort alphabetically (otherwise: original order). These set the
-            global policy; a `// TO REORDER <opts>` region header overrides it.
+        --same-level-outside-of-mutual--topological
+            Set the global ordering policy; a `// TO REORDER <opts>` region
+            header overrides it. The default is original order for ties.
+
+MODES:
+    reorder is the default and rewrites/dry-runs reordered source.
+    check reports and exits nonzero when an item uses a later non-mutual item.
 
 SCOPED MODE:
     If a file contains at least one `// TO REORDER` ... `// TO REORDER END`
@@ -48,9 +63,23 @@ OUTPUTS (written under a per-run temp dir, opened with xdg-open):
     -h, --help                     show this help";
 
 fn parse_cli() -> Cli {
+    let mut args = std::env::args().skip(1).peekable();
+    let mode = match args.peek().map(String::as_str) {
+        Some("reorder") => {
+            let _ = args.next();
+            Mode::Reorder
+        }
+        Some("check") => {
+            let _ = args.next();
+            Mode::Check
+        }
+        _ => Mode::Reorder,
+    };
     let mut c = Cli {
+        mode,
         patterns: vec![],
         inside_alpha: false,
+        outside_topological: false,
         outside_alpha: false,
         mermaid_before: false,
         mermaid_after: false,
@@ -59,7 +88,7 @@ fn parse_cli() -> Cli {
         stdout: false,
         color: std::io::stdout().is_terminal(),
     };
-    for a in std::env::args().skip(1) {
+    for a in args {
         match a.as_str() {
             "-h" | "--help" => {
                 println!("{USAGE}");
@@ -67,6 +96,7 @@ fn parse_cli() -> Cli {
             }
             "--same-level-inside-of-mutual--alphabetically" => c.inside_alpha = true,
             "--same-level-outside-of-mutual--alphabetically" => c.outside_alpha = true,
+            "--same-level-outside-of-mutual--topological" => c.outside_topological = true,
             "--mermaid-write-before" => c.mermaid_before = true,
             "--mermaid-write-after" => c.mermaid_after = true,
             "--write-html-before-after-diff-table" => c.html_diff = true,
@@ -82,6 +112,12 @@ fn parse_cli() -> Cli {
     }
     if c.patterns.is_empty() {
         eprintln!("error: at least one glob pattern is required\n\n{USAGE}");
+        std::process::exit(2);
+    }
+    if c.outside_alpha && c.outside_topological {
+        eprintln!(
+            "error: choose only one outside-mutual ordering mode\n\n{USAGE}"
+        );
         std::process::exit(2);
     }
     c
@@ -113,6 +149,7 @@ struct FileReport {
     mutual: usize,
     items: usize,
     changed: bool,
+    failed: bool,
 }
 
 #[tokio::main]
@@ -140,7 +177,13 @@ async fn main() {
 
     let opts = OrderOpts {
         inside: if cli.inside_alpha { Tie::Alphabetical } else { Tie::Original },
-        outside: if cli.outside_alpha { Tie::Alphabetical } else { Tie::Original },
+        outside: if cli.outside_alpha {
+            Tie::Alphabetical
+        } else if cli.outside_topological {
+            Tie::Topological
+        } else {
+            Tie::Original
+        },
     };
 
     let mut set = tokio::task::JoinSet::new();
@@ -179,6 +222,10 @@ async fn main() {
         println!("  items moved:   {moved}");
         println!("  mutual groups: {mutual}");
     }
+
+    if reports.iter().any(|r| r.failed) {
+        std::process::exit(1);
+    }
 }
 
 async fn process_file(
@@ -191,6 +238,9 @@ async fn process_file(
     paint: Paint,
 ) -> Option<FileReport> {
     let src = tokio::fs::read_to_string(&path).await.ok()?;
+    if cli.mode == Mode::Check {
+        return process_check(path, src, paint).await;
+    }
 
     // CPU-bound transform off the async runtime.
     let outcome: Result<Outcome, String> = tokio::task::spawn_blocking(move || {
@@ -205,7 +255,14 @@ async fn process_file(
         Ok(o) => o,
         Err(e) => {
             lines.push(paint.yellow(&format!("parse error: {e}")));
-            return Some(FileReport { lines, moved: 0, mutual: 0, items: 0, changed: false });
+            return Some(FileReport {
+                lines,
+                moved: 0,
+                mutual: 0,
+                items: 0,
+                changed: false,
+                failed: true,
+            });
         }
     };
 
@@ -304,7 +361,62 @@ async fn process_file(
         mutual: plan.mutual_groups.len(),
         items: plan.nodes.len(),
         changed,
+        failed: false,
     })
+}
+
+async fn process_check(path: PathBuf, src: String, paint: Paint) -> Option<FileReport> {
+    let report = tokio::task::spawn_blocking(move || check(&src).map_err(|e| e.to_string()))
+        .await
+        .ok()?;
+    let mut lines = vec![paint.bold(&format!("=== {} ===", path.display()))];
+    match report {
+        Ok(report) if report.is_ok() => {
+            lines.push(paint.green("ok"));
+            Some(FileReport {
+                lines,
+                moved: 0,
+                mutual: 0,
+                items: 0,
+                changed: false,
+                failed: false,
+            })
+        }
+        Ok(report) => {
+            lines.push(paint.yellow(&format!(
+                "{} before-definition use(s) found:",
+                report.violations.len()
+            )));
+            for v in report.violations {
+                lines.push(format!(
+                    "  {} uses later {} (item #{} before #{})",
+                    v.user,
+                    v.dependency,
+                    v.user_index + 1,
+                    v.dependency_index + 1
+                ));
+            }
+            Some(FileReport {
+                lines,
+                moved: 0,
+                mutual: 0,
+                items: 0,
+                changed: false,
+                failed: true,
+            })
+        }
+        Err(e) => {
+            lines.push(paint.yellow(&format!("parse error: {e}")));
+            Some(FileReport {
+                lines,
+                moved: 0,
+                mutual: 0,
+                items: 0,
+                changed: false,
+                failed: true,
+            })
+        }
+    }
 }
 
 

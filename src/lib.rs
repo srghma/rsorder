@@ -45,6 +45,71 @@ pub struct Outcome {
     pub plan: Plan,
 }
 
+#[derive(Debug, Clone)]
+pub struct CheckViolation {
+    pub user: String,
+    pub user_index: usize,
+    pub dependency: String,
+    pub dependency_index: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct CheckReport {
+    pub violations: Vec<CheckViolation>,
+}
+
+impl CheckReport {
+    pub fn is_ok(&self) -> bool { self.violations.is_empty() }
+}
+
+/// Validate that every non-mutual dependency is declared before the item that
+/// uses it. Dependencies within the same multi-item SCC are treated as mutual.
+pub fn check(src: &str) -> syn::Result<CheckReport> {
+    let model = analyze::parse(src)?;
+    let items = &model.items;
+    let names: Vec<String> = items
+        .iter()
+        .map(|i| i.name.clone().unwrap_or_else(|| i.display.clone()))
+        .collect();
+    let deps_g: Vec<Vec<usize>> = items.iter().map(|i| i.deps.clone()).collect();
+    let reorderable: Vec<usize> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, it)| !it.pinned)
+        .map(|(i, _)| i)
+        .collect();
+    let (_, groups) = order_scope(
+        &reorderable,
+        &deps_g,
+        &names,
+        OrderOpts { inside: order::Tie::Original, outside: order::Tie::Original },
+    );
+    let mut group_of = HashMap::new();
+    for (gid, group) in groups.iter().enumerate() {
+        for &g in group {
+            group_of.insert(g, gid);
+        }
+    }
+
+    let mut violations = Vec::new();
+    for &user in &reorderable {
+        for &dep in &deps_g[user] {
+            let same_mutual_group =
+                group_of.get(&dep) == group_of.get(&user) && group_of.contains_key(&dep);
+            if dep < user || same_mutual_group {
+                continue;
+            }
+            violations.push(CheckViolation {
+                user: names[user].clone(),
+                user_index: user,
+                dependency: names[dep].clone(),
+                dependency_index: dep,
+            });
+        }
+    }
+    Ok(CheckReport { violations })
+}
+
 /// Reorder a single source string. `global` is the CLI-level ordering policy;
 /// `// TO REORDER` regions may override it locally.
 pub fn reorder(src: &str, global: OrderOpts) -> syn::Result<Outcome> {
